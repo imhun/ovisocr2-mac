@@ -173,6 +173,8 @@ def run_llama(
     ctx: int,
     threads: int,
     ngl: int,
+    temp: float = 0.0,
+    seed: int = 42,
     device: str | None = None,
     mmproj_offload: bool = True,
     verbose: bool = False,
@@ -188,6 +190,9 @@ def run_llama(
         "-t", str(threads),
         "-ngl", str(ngl),
         "--no-warmup",
+        # 文档解析要可复现：默认贪心解码，同一页重跑结果一致
+        "--temp", str(temp),
+        "--seed", str(seed),
     ]
     if device:
         # 多后端二进制（Metal + Vulkan 都在）不锁设备的话，层会被拆到两个后端上
@@ -229,6 +234,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-t", "--threads", type=int, default=8)
     ap.add_argument("-ngl", "--ngl", type=int, default=99,
                     help="offload 到 GPU 的层数；99=全部（无 GPU 后端时忽略）")
+    ap.add_argument("--temp", type=float, default=0.0,
+                    help="采样温度（默认 0 = 贪心解码，同一页重跑结果一致）")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="采样随机种子（默认 42；温度为 0 时无影响）")
     ap.add_argument("--device", default=None,
                     help="把模型锁到单个设备上（透传 -dev），例如 Vulkan0。"
                          "同时带 Metal 和 Vulkan 的二进制不锁设备会把层拆开，输出会坏")
@@ -270,6 +279,8 @@ def main(argv: list[str] | None = None) -> int:
                 ctx=args.ctx_size,
                 threads=args.threads,
                 ngl=args.ngl,
+                temp=args.temp,
+                seed=args.seed,
                 device=args.device,
                 mmproj_offload=not args.no_mmproj_offload,
                 verbose=args.verbose,
