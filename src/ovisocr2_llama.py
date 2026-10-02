@@ -2,11 +2,21 @@
 
 首选后端：ToshLLM 补丁版的 Metal（AMD GPU 加速）。
   AMD Radeon Pro 5500M 实测：视觉编码 6.2s，整页 15s，输出正确。
-  对比 stock llama.cpp：Metal 触发 GPU Timeout 输出乱码，Vulkan 输出全 "1"，
-  CPU 则要 159s 编码。详见 README.md 第三节。
+  对比 stock llama.cpp：Metal 触发 GPU Timeout 输出乱码；Vulkan 的文本路径本身没问题，
+  但视觉编码器算错（误差随图像分辨率放大），CPU 则要 159s 编码。归因与实测数据见
+  llamacpp-metal-amd 仓库的 README。
 
 回退后端：官方 llama.cpp 的 CPU 路径（Accelerate）。
   此时建议用 --max-side 1000 缩图，可把视觉编码从 159s 降到 26s。
+
+Vulkan 后端（可选）：文本放 AMD 独显，视觉编码回退 CPU，输出与 Metal 逐字节一致。
+  必须同时给 --device Vulkan0 和 --no-mmproj-offload：前者防止层被拆到 Metal/Vulkan
+  两个后端上（那样是整屏 @@@@），后者避开 Vulkan 视觉编码的数值错误（否则退化成
+  "1 1 1…"）::
+
+    python src/ovisocr2_llama.py page.jpg -o out \
+        --llama-bin tmp/llama.cpp/build-vulkan/bin/llama-mtmd-cli \
+        --device Vulkan0 --no-mmproj-offload
 
 用法::
 
@@ -163,6 +173,8 @@ def run_llama(
     ctx: int,
     threads: int,
     ngl: int,
+    device: str | None = None,
+    mmproj_offload: bool = True,
     verbose: bool = False,
 ) -> str:
     cmd = [
@@ -177,6 +189,12 @@ def run_llama(
         "-ngl", str(ngl),
         "--no-warmup",
     ]
+    if device:
+        # 多后端二进制（Metal + Vulkan 都在）不锁设备的话，层会被拆到两个后端上
+        cmd += ["-dev", device]
+    if not mmproj_offload:
+        # Vulkan 上视觉编码在长边超过 ~1024 后会算错，放回 CPU 才是对的
+        cmd.append("--no-mmproj-offload")
     # 日志走 stderr，stdout 只保留生成的 Markdown
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if verbose and proc.stderr:
@@ -211,6 +229,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-t", "--threads", type=int, default=8)
     ap.add_argument("-ngl", "--ngl", type=int, default=99,
                     help="offload 到 GPU 的层数；99=全部（无 GPU 后端时忽略）")
+    ap.add_argument("--device", default=None,
+                    help="把模型锁到单个设备上（透传 -dev），例如 Vulkan0。"
+                         "同时带 Metal 和 Vulkan 的二进制不锁设备会把层拆开，输出会坏")
+    ap.add_argument("--no-mmproj-offload", action="store_true",
+                    help="视觉编码器不上 GPU（透传 --no-mmproj-offload）。"
+                         "Vulkan 上视觉编码在长边超过 ~1024 后会算错，必须加这个")
     ap.add_argument("--keep-visual-regions", action="store_true",
                     help="保留 <img> 占位并导出对应裁剪图（图表/流程图）；"
                          "默认去掉这些占位")
@@ -220,6 +244,9 @@ def main(argv: list[str] | None = None) -> int:
 
     llama_bin = find_llama_cli(args.llama_bin)
     log(f"llama-mtmd-cli: {llama_bin}")
+    if args.device and "vulkan" in args.device.lower() and not args.no_mmproj_offload:
+        log("警告：Vulkan 的视觉编码器在图像长边超过 ~1024 后会算错"
+            "（实测 1600 时偏差 500%+），建议加上 --no-mmproj-offload 放回 CPU")
 
     pages = collect_inputs(args.input)
     if not pages:
@@ -243,6 +270,8 @@ def main(argv: list[str] | None = None) -> int:
                 ctx=args.ctx_size,
                 threads=args.threads,
                 ngl=args.ngl,
+                device=args.device,
+                mmproj_offload=not args.no_mmproj_offload,
                 verbose=args.verbose,
             )
 
