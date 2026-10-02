@@ -1,6 +1,10 @@
-# OvisOCR2 推理依赖（Apple Silicon / NVIDIA 上使用）
-# 注意：Intel Mac 装不了 torch>=2.5，详见 README.md
-torch>=2.5
-transformers>=5.0
+# llama.cpp 推理路径的运行依赖（Intel Mac 上可用，也就是本仓库的主路径）。
+#
+#   pillow            src/ovisocr2_llama.py 读图与裁剪
+#   pymupdf           src/pdf2md.py 渲染页面、检测图表
+#   firecrawl-anydoc  PDF / Office 转 Markdown
+#
+# PyTorch 那条路（需要 Apple Silicon）的依赖在 requirements-torch.txt。
 pillow
-numpy<2
+pymupdf
+firecrawl-anydoc

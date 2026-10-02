@@ -22,6 +22,34 @@ macOS 26.7.1，**非 Apple Silicon**。以下结论均来自本机实测。
 
 ---
 
+## 一键构建
+
+克隆仓库后跑一条命令，脚本会依次完成：环境检查 → Python 依赖 → 下载 GGUF 权重 →
+clone llama.cpp 并打上 119 个补丁 → 编译 `llama-mtmd-cli` → 冒烟测试。
+
+```bash
+./scripts/build.sh
+
+# 国内网络下载权重慢，指定镜像
+HF_BASE=https://hf-mirror.com/Abiray/OvisOCR2-GGUF/resolve/main ./scripts/build.sh
+
+# 权重已下好 / 只更新代码
+./scripts/build.sh --skip-models
+
+# 从头再来（删掉源码树和构建产物）
+./scripts/build.sh --clean
+```
+
+每一步都会先检查是否已经完成，可以反复执行。首次编译大约 5-15 分钟（16 核实测），
+之后重跑会直接跳过。全部参数见 `./scripts/build.sh --help`。
+
+冒烟测试会生成一张小测试图跑一次 OCR，并检查三件事：输出非空、没有 `@@@@` 之类的
+退化内容、日志里能读到 Metal 设备。这三项通过，说明补丁和 GPU 后端都正常工作。
+
+不想用脚本的话，下面几节是每一步的手动做法和原理。
+
+---
+
 ## 二、PyTorch + MPS 为何不可行
 
 不是配置问题，是版本链死锁：
@@ -198,7 +226,8 @@ ggml_metal: device 0: AMD Radeon Pro 5500M (peer group 0, not bridged)
 | 3508 | 18.6 s | ❌ 输出损坏 |
 
 因此 `src/ovisocr2_llama.py` 默认 `--max-side 1600`，并把超过 2000 的值强制压到 2000，
-同时对输出做损坏检测（识别 `@@@@` 与重复的 `## 1`）并告警。
+同时对输出做损坏检测（识别 `@@@@` 与重复的 `## 1`）并告警。排查时加 `-v` 可以把
+llama.cpp 的原始日志透传出来，确认接管的是不是 Metal 后端。
 
 > 备注：`patches/llama/` 下共 119 个补丁，光 `0001` 和 `0002` 两个就有 15788 行，
 > 是针对 upstream `9575389609d6` 的完整 Metal 后端重建；换 commit 需要重新适配。
@@ -212,8 +241,10 @@ ggml_metal: device 0: AMD Radeon Pro 5500M (peer group 0, not bridged)
 ### 方案 A：本机 llama.cpp + ToshLLM Metal 补丁（AMD GPU，推荐）
 
 ```bash
-python src/ovisocr2_llama.py page.jpg -o out           # 默认 1600，约 9s/页
-python src/ovisocr2_llama.py scans/ -o out --max-side 2000   # 更清晰，约 15s/页
+./scripts/build.sh                                     # 一键构建（推荐）
+
+.venv/bin/python src/ovisocr2_llama.py page.jpg -o out                  # 默认 1600
+.venv/bin/python src/ovisocr2_llama.py scans/ -o out --max-side 2000    # 更清晰
 ```
 
 脚本会按 `tmp/tosh-llama/build-tosh/bin/llama-mtmd-cli` → `PATH` → 官方构建
@@ -246,9 +277,11 @@ M1 及以上即可，建议 M2+（原生 bf16 支持）。环境：
 
 ```bash
 uv venv --python 3.12 .venv
-uv pip install "torch>=2.5" transformers pillow
-python src/ovisocr2_pytorch.py page.jpg -o out   # 见第五节
+uv pip install -r requirements-torch.txt   # torch / transformers / pillow
+.venv/bin/python src/ovisocr2_pytorch.py page.jpg -o out
 ```
+
+Intel Mac 上这份依赖装不上，属于预期行为，原因见第二节。
 
 ### 方案 C：云端 / 远程 GPU
 
@@ -270,8 +303,11 @@ pip install "vllm==0.22.1" pillow
 | `src/ovisocr2_llama.py` | **可用**：llama.cpp CPU 推理（含自动缩图、think 清理） |
 | `src/ovisocr2_pytorch.py` | PyTorch / MPS 推理（需 Apple Silicon，本机跑不了） |
 | `patches/llama/` | ToshLLM v0.87.13 的 119 个 llama.cpp 补丁（GPL-3.0-or-later，来源见 `patches/README.md`） |
+| `scripts/build.sh` | **一键构建**：环境检查、依赖、权重、clone + 打补丁、编译、冒烟测试 |
 | `scripts/mps_probe.py` | MPS 能力与性能探测，可复现第二节 2 的数据 |
 | `scripts/fetch_gguf.sh` | GGUF 下载脚本（断点续传 + 重试，`HF_BASE` 可指向 hf-mirror 镜像） |
+| `requirements.txt` | llama.cpp 路径的运行依赖（pillow / pymupdf / firecrawl-anydoc） |
+| `requirements-torch.txt` | PyTorch 路径的依赖（torch / transformers，需 Apple Silicon） |
 | `models/` | GGUF 权重（`OvisOCR2-Q4_K_M.gguf` + `mmproj-F16.gguf`） |
 | `tmp/` | 工作目录（不入库）：官方 llama.cpp 源码与构建、ToshLLM 补丁版构建、测试产物 |
 

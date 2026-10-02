@@ -154,6 +154,7 @@ def run_llama(
     ctx: int,
     threads: int,
     ngl: int,
+    verbose: bool = False,
 ) -> str:
     cmd = [
         llama_bin,
@@ -169,6 +170,10 @@ def run_llama(
     ]
     # 日志走 stderr，stdout 只保留生成的 Markdown
     proc = subprocess.run(cmd, capture_output=True, text=True)
+    if verbose and proc.stderr:
+        # --verbose 时把 llama.cpp 的日志透传出来，用来确认接管的是哪个后端
+        # （ToshLLM Metal 会打印 "ggml_metal: device 0: ... not bridged"）
+        sys.stderr.write(proc.stderr)
     if proc.returncode != 0:
         raise SystemExit(f"llama-mtmd-cli 失败 (code={proc.returncode}):\n{proc.stderr[-2000:]}")
     return strip_think(proc.stdout)
@@ -200,6 +205,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--keep-visual-regions", action="store_true",
                     help="保留 <img> 占位并导出对应裁剪图（图表/流程图）；"
                          "默认去掉这些占位")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="透传 llama.cpp 的日志到 stderr（确认 GPU 后端、排查损坏输出）")
     args = ap.parse_args(argv)
 
     llama_bin = find_llama_cli(args.llama_bin)
@@ -227,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
                 ctx=args.ctx_size,
                 threads=args.threads,
                 ngl=args.ngl,
+                verbose=args.verbose,
             )
 
             text = markdown if args.keep_visual_regions else strip_bbox_tags(markdown)

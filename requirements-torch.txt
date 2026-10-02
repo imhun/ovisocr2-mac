@@ -1,0 +1,7 @@
+# Apple Silicon（或 NVIDIA 机器）上的 PyTorch 推理路径，见 README 第四节方案 B。
+# Intel Mac 装不了：torch 自 2.3.0 起没有 macOS x86_64 wheel，
+# 而 transformers 5.x 要求 torch>=2.5，版本链对不上。
+torch>=2.5
+transformers>=5.0
+pillow
+numpy<2
