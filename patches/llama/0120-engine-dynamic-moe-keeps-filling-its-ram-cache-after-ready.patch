@@ -1,0 +1,32 @@
+diff --git a/tosh-moe/tosh-hostcache.cpp b/tosh-moe/tosh-hostcache.cpp
+index 054c2df64..04070fbbf 100644
+--- a/tosh-moe/tosh-hostcache.cpp
++++ b/tosh-moe/tosh-hostcache.cpp
+@@ -416,12 +416,12 @@ bool tosh_hostcache_start(int n_layer, int n_expert) {
+     prewarm(n_io);
+     return g.error.empty();
+ }
+ 
+ // EXPERIMENT: TOSH_DMOE_HOST_WARMUP_FILL_MIB (a number, or max) reads experts in file order into free
+-// slots while the model finishes loading and warms up, and stops when the server is ready. Demand
+-// never waits on it: an entry is published only once read, and last in line for eviction.
++// slots from the moment the model finishes loading, past ready, until the budget or the slots run
++// out. Demand never waits on it: an entry is published only once read, and last in line for eviction.
+ static void start_warmup_fill() {
+     const char * v = getenv("TOSH_DMOE_HOST_WARMUP_FILL_MIB");
+     if (v == nullptr) return;
+     const size_t budget = strcmp(v, "max") == 0 ? g.locked_bytes : (size_t) (atof(v)*1048576.0);
+     if (budget == 0) return;
+@@ -430,11 +430,11 @@ static void start_warmup_fill() {
+     auto left = std::make_shared<std::atomic<int>>(n_th);
+     for (int t = 0; t < n_th; ++t) {
+         std::thread([budget, next, left] {
+             pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+             const int n_keys = g.n_layer*g.n_expert;
+-            for (int key; (key = (*next)++) < n_keys && !g.ready;) {
++            for (int key; (key = (*next)++) < n_keys;) {
+                 const int il = key / g.n_expert, e = key % g.n_expert;
+                 int s;
+                 {
+                     std::lock_guard<std::mutex> lock(g.m);
+                     if (g.pool_of_layer[il] < 0 || g.slot_of[key] >= 0) continue;

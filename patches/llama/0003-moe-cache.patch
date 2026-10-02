@@ -1,0 +1,2324 @@
+diff --git a/ggml/src/ggml-turbo-quant.c b/ggml/src/ggml-turbo-quant.c
+new file mode 100644
+index 000000000..c10b750d1
+--- /dev/null
++++ b/ggml/src/ggml-turbo-quant.c
+@@ -0,0 +1,1030 @@
++/*
++ * TurboQuant: KV cache compression via PolarQuant + QJL
++ * Based on: arXiv 2504.19874 (ICLR 2026)
++ *
++ * Implements GGML_TYPE_TURBO2_0 (2-bit), GGML_TYPE_TURBO3_0 (3-bit) and
++ * GGML_TYPE_TURBO4_0 (4-bit) for use as --cache-type-k turboN in llama-server.
++ */
++
++#include "ggml-quants.h"
++#include "ggml-common.h"
++#include "ggml-impl.h"
++
++#define _USE_MATH_DEFINES
++#include <math.h>
++#include <string.h>
++#include <assert.h>
++#include <stdlib.h>
++
++#ifndef M_PI
++#define M_PI 3.14159265358979323846
++#endif
++
++/* Forward declarations for GGML_API symbols defined in this file (satisfies
++ * -Wmissing-prototypes under upstream CI's -Werror policy). */
++GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size);
++
++/* Global: WHT group size for CPU quantize path (set by CPU SET_ROWS handler) */
++GGML_API int turbo3_cpu_wht_group_size = 0;
++
++/* ---------- constants ---------- */
++
++#define TURBO_SEED_ROTATION 42
++#define TURBO_SEED_QJL      1042
++#define TURBO_D             128  /* rotation group size = head_dim (independent of block size) */
++#define TURBO_QJL_CONST     1.2533141373155003f  /* sqrt(pi/2) */
++
++/* Optimal centroids from paper (scaled by 1/sqrt(d)) */
++/* 2-bit: {±0.453, ±1.51} / sqrt(d) */
++static const float CENTROIDS_2BIT[4] = { -0.133462f, -0.039994f, 0.039994f, 0.133462f };
++
++/* 3-bit: Lloyd-Max for N(0, 1/128), pre-computed */
++static const float CENTROIDS_3BIT[8] = {
++    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
++     0.021460f,  0.065717f,  0.117832f,  0.190685f
++};
++
++/* ---------- rotation matrix (lazy init) ---------- */
++
++static float turbo_rotation[TURBO_D * TURBO_D];
++static float turbo_rotation_t[TURBO_D * TURBO_D]; /* transpose */
++static int   turbo_rotation_initialized = 0;
++
++/* Simple LCG PRNG for deterministic rotation generation */
++static uint64_t turbo_prng_state;
++
++static void turbo_prng_seed(uint64_t seed) {
++    turbo_prng_state = seed;
++}
++
++static double turbo_prng_normal(void) {
++    /* Box-Muller transform from uniform LCG */
++    turbo_prng_state = turbo_prng_state * 6364136223846793005ULL + 1442695040888963407ULL;
++    double u1 = (double)(turbo_prng_state >> 11) / (double)(1ULL << 53);
++    if (u1 < 1e-15) u1 = 1e-15;
++    turbo_prng_state = turbo_prng_state * 6364136223846793005ULL + 1442695040888963407ULL;
++    double u2 = (double)(turbo_prng_state >> 11) / (double)(1ULL << 53);
++    return sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
++}
++
++static void turbo_init_rotation(void) {
++    if (turbo_rotation_initialized) return;
++
++    const int d = TURBO_D;
++
++    /* Generate random Gaussian matrix */
++    turbo_prng_seed(TURBO_SEED_ROTATION);
++    float G[TURBO_D * TURBO_D];
++    for (int i = 0; i < d * d; i++) {
++        G[i] = (float)turbo_prng_normal();
++    }
++
++    /* QR decomposition via modified Gram-Schmidt */
++    /* Q stored column-major in turbo_rotation */
++    memcpy(turbo_rotation, G, d * d * sizeof(float));
++
++    for (int j = 0; j < d; j++) {
++        /* Normalize column j */
++        float norm = 0.0f;
++        for (int i = 0; i < d; i++) {
++            norm += turbo_rotation[i * d + j] * turbo_rotation[i * d + j];
++        }
++        norm = sqrtf(norm);
++        if (norm > 1e-10f) {
++            for (int i = 0; i < d; i++) {
++                turbo_rotation[i * d + j] /= norm;
++            }
++        }
++
++        /* Orthogonalize remaining columns against j */
++        for (int k = j + 1; k < d; k++) {
++            float dot = 0.0f;
++            for (int i = 0; i < d; i++) {
++                dot += turbo_rotation[i * d + j] * turbo_rotation[i * d + k];
++            }
++            for (int i = 0; i < d; i++) {
++                turbo_rotation[i * d + k] -= dot * turbo_rotation[i * d + j];
++            }
++        }
++    }
++
++    /* Compute transpose */
++    for (int i = 0; i < d; i++) {
++        for (int j = 0; j < d; j++) {
++            turbo_rotation_t[i * d + j] = turbo_rotation[j * d + i];
++        }
++    }
++
++    turbo_rotation_initialized = 1;
++}
++
++/* ---------- QJL projection matrix (lazy init, seed-based) ---------- */
++
++static float turbo_qjl_matrix[TURBO_D * TURBO_D];
++static float turbo_qjl_matrix_t[TURBO_D * TURBO_D];
++static int   turbo_qjl_initialized = 0;
++
++static void turbo_init_qjl(void) {
++    if (turbo_qjl_initialized) return;
++
++    const int d = TURBO_D;
++    turbo_prng_seed(TURBO_SEED_QJL);
++
++    for (int i = 0; i < d * d; i++) {
++        turbo_qjl_matrix[i] = (float)turbo_prng_normal();
++    }
++
++    /* Transpose */
++    for (int i = 0; i < d; i++) {
++        for (int j = 0; j < d; j++) {
++            turbo_qjl_matrix_t[i * d + j] = turbo_qjl_matrix[j * d + i];
++        }
++    }
++
++    turbo_qjl_initialized = 1;
++}
++
++/* ---------- helper: matrix-vector multiply ---------- */
++
++static void matvec(const float * M, const float * x, float * y, int d) {
++    /* y = M @ x, M is row-major d×d */
++    for (int i = 0; i < d; i++) {
++        float sum = 0.0f;
++        for (int j = 0; j < d; j++) {
++            sum += M[i * d + j] * x[j];
++        }
++        y[i] = sum;
++    }
++}
++
++/* ---------- nearest centroid ---------- */
++
++static int nearest_centroid_2bit(float val) {
++    /* Binary search on midpoints: {-0.133, -0.040, 0.040, 0.133} */
++    if (val < -0.086728f) return 0;       /* midpoint(-0.133, -0.040) */
++    if (val <  0.000000f) return 1;       /* midpoint(-0.040, 0.040) */
++    if (val <  0.086728f) return 2;       /* midpoint(0.040, 0.133) */
++    return 3;
++}
++
++static int nearest_centroid_3bit(float val) {
++    /* 8 centroids, find nearest via midpoints */
++    if (val < -0.154259f) return 0;
++    if (val < -0.091775f) return 1;
++    if (val < -0.043589f) return 2;
++    if (val <  0.000000f) return 3;
++    if (val <  0.043589f) return 4;
++    if (val <  0.091775f) return 5;
++    if (val <  0.154259f) return 6;
++    return 7;
++}
++
++static int nearest_centroid_4bit(float val) {
++    /* 16 centroids, optimal for N(0, 1/sqrt(128)), find nearest via midpoints */
++    if (val < -0.145560f) return 0;
++    if (val < -0.103361f) return 1;
++    if (val < -0.079142f) return 2;
++    if (val < -0.060009f) return 3;
++    if (val < -0.043430f) return 4;
++    if (val < -0.028293f) return 5;
++    if (val < -0.013963f) return 6;
++    if (val <  0.000000f) return 7;
++    if (val <  0.013963f) return 8;
++    if (val <  0.028293f) return 9;
++    if (val <  0.043430f) return 10;
++    if (val <  0.060009f) return 11;
++    if (val <  0.079142f) return 12;
++    if (val <  0.103361f) return 13;
++    if (val <  0.145560f) return 14;
++    return 15;
++}
++
++/* ---------- WHT sign arrays (must match CUDA/Metal, seed=42) ---------- */
++
++static const float turbo_cpu_s1[128] = {
++    -1,1,1,-1,-1,1,-1,1,-1,-1,1,1,1,1,1,1,1,-1,1,-1,1,-1,-1,1,1,1,-1,1,1,-1,-1,-1,
++    -1,1,1,-1,1,1,-1,1,-1,1,1,-1,-1,1,-1,1,1,1,1,-1,-1,-1,-1,-1,1,-1,1,1,1,1,-1,1,
++    -1,-1,1,-1,-1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,1,-1,-1,1,1,1,-1,-1,1,1,-1,1,1,-1,1,-1,
++    -1,1,1,-1,1,-1,1,-1,1,1,1,1,-1,1,-1,1,1,-1,1,1,-1,-1,-1,-1,-1,1,1,-1,1,1,-1,1
++};
++
++static const float turbo_cpu_s2[128] = {
++    1,1,1,1,-1,1,1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,-1,-1,1,-1,1,-1,1,-1,-1,1,-1,1,1,1,
++    1,1,-1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,1,-1,1,-1,1,1,1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,
++    1,-1,1,-1,-1,-1,-1,1,-1,1,-1,1,-1,-1,1,1,-1,1,-1,1,1,-1,1,-1,-1,-1,-1,1,-1,-1,1,-1,
++    1,-1,1,1,1,-1,-1,1,-1,1,-1,1,1,-1,-1,1,-1,1,-1,1,1,-1,1,-1,1,-1,-1,-1,-1,-1,1,-1
++};
++
++/* ---------- CPU forward WHT (in-place, group_size elements) ---------- */
++
++static void turbo_cpu_fwht(float * x, int group_size) {
++    const float * s1 = turbo_cpu_s1;
++    const float * s2 = turbo_cpu_s2;
++    const float inv_sqrt = (group_size == 128) ? 0.08838834764831845f : 0.125f;
++
++    // signs1
++    for (int i = 0; i < group_size; i++) x[i] *= s1[i];
++
++    // butterfly stages
++    for (int h = 1; h < group_size; h *= 2) {
++        for (int i = 0; i < group_size; i += h * 2) {
++            for (int j = i; j < i + h; j++) {
++                float a = x[j], b = x[j + h];
++                x[j]     = a + b;
++                x[j + h] = a - b;
++            }
++        }
++    }
++
++    // normalize + signs2
++    for (int i = 0; i < group_size; i++) x[i] *= inv_sqrt * s2[i];
++}
++
++/* ---------- CPU inverse WHT (in-place, group_size elements) ----------
++ *
++ * Forward is  y = D(s2) * N * H * D(s1) * x   (N = 1/sqrt(group_size))
++ * H is the unnormalized Hadamard butterfly with H*H = group_size * I, so
++ * (N*H) is self-inverse.  s1 and s2 are ±1 diagonals, also self-inverse.
++ * The inverse therefore has the same structure with s1 and s2 swapped:
++ *     x = D(s1) * N * H * D(s2) * y
++ */
++GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size) {
++    const float * s1 = turbo_cpu_s1;
++    const float * s2 = turbo_cpu_s2;
++    const float inv_sqrt = (group_size == 128) ? 0.08838834764831845f : 0.125f;
++
++    // signs2 (undoes the s2 that was applied last in the forward pass)
++    for (int i = 0; i < group_size; i++) x[i] *= s2[i];
++
++    // butterfly stages (same as forward — self-inverse up to the inv_sqrt scaling below)
++    for (int h = 1; h < group_size; h *= 2) {
++        for (int i = 0; i < group_size; i += h * 2) {
++            for (int j = i; j < i + h; j++) {
++                float a = x[j], b = x[j + h];
++                x[j]     = a + b;
++                x[j + h] = a - b;
++            }
++        }
++    }
++
++    // normalize + signs1
++    for (int i = 0; i < group_size; i++) x[i] *= inv_sqrt * s1[i];
++}
++
++/* ---------- TURBO3_0: 3-bit PolarQuant with WHT rotation ---------- */
++
++void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_TURBO3 == 0);
++
++    // Read WHT group size from global (set by CPU SET_ROWS handler before each call).
++    // Fallback: 128 if row is 128-aligned, else 64.
++    extern int turbo3_cpu_wht_group_size;
++    int group_size = turbo3_cpu_wht_group_size;
++    if (group_size != 64 && group_size != 128) {
++        group_size = (k % 128 == 0) ? 128 : 64;
++    }
++    if (k % group_size != 0) group_size = (group_size == 128) ? 64 : 128;
++    assert(k % group_size == 0);
++
++    const int n_groups = k / group_size;
++    const int blocks_per_group = group_size / QK_TURBO3;
++
++    for (int g = 0; g < n_groups; g++) {
++        const float * grp_src = x + g * group_size;
++        block_turbo3_0 * grp_dst = y + g * blocks_per_group;
++
++        // 1. L2 norm over the group
++        float norm_sq = 0.0f;
++        float buf[128];  // max group_size
++        for (int j = 0; j < group_size; j++) {
++            buf[j] = grp_src[j];
++            norm_sq += buf[j] * buf[j];
++        }
++        float grp_norm = sqrtf(norm_sq);
++        float inv_norm = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
++
++        // 2. Normalize
++        for (int j = 0; j < group_size; j++) buf[j] *= inv_norm;
++
++        // 3. Forward WHT rotation
++        turbo_cpu_fwht(buf, group_size);
++
++        // 4. Quantize + pack into sub-blocks
++        float recon_sq = 0.0f;
++        for (int b = 0; b < blocks_per_group; b++) {
++            block_turbo3_0 * blk = &grp_dst[b];
++            const int off = b * QK_TURBO3;
++
++            memset(blk->qs, 0, QK_TURBO3 / 4);
++            memset(blk->signs, 0, QK_TURBO3 / 8);
++
++            for (int j = 0; j < QK_TURBO3; j++) {
++                int idx = nearest_centroid_3bit(buf[off + j]);
++                blk->qs[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
++                if (idx & 0x4) {
++                    blk->signs[j / 8] |= (1 << (j % 8));
++                }
++                recon_sq += CENTROIDS_3BIT[idx] * CENTROIDS_3BIT[idx];
++            }
++        }
++
++        // 5. Corrected norm: grp_norm / recon_norm (matching CUDA kernel)
++        float recon_norm = sqrtf(recon_sq);
++        float corrected = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
++        for (int b = 0; b < blocks_per_group; b++) {
++            grp_dst[b].norm = GGML_FP32_TO_FP16(corrected);
++        }
++    }
++}
++
++void dequantize_row_turbo3_0(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    // Stub — Metal shader handles dequant on GPU.
++    assert(k % QK_TURBO3 == 0);
++    const int nb = k / QK_TURBO3;
++    for (int block = 0; block < nb; block++) {
++        float norm = GGML_FP16_TO_FP32(x[block].norm);
++        for (int j = 0; j < QK_TURBO3; j++) {
++            uint8_t low2 = (x[block].qs[j/4] >> ((j%4)*2)) & 0x3;
++            uint8_t hi1 = (x[block].signs[j/8] >> (j%8)) & 0x1;
++            uint8_t idx = low2 | (hi1 << 2);
++            y[block * QK_TURBO3 + j] = CENTROIDS_3BIT[idx] * norm;
++        }
++    }
++}
++
++size_t quantize_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
++                         int64_t nrows, int64_t n_per_row, const float * imatrix) {
++    GGML_UNUSED(imatrix);
++    assert(n_per_row % QK_TURBO3 == 0);
++
++    size_t row_size = (n_per_row / QK_TURBO3) * sizeof(block_turbo3_0);
++    for (int64_t row = 0; row < nrows; row++) {
++        quantize_row_turbo3_0_ref(
++            src + row * n_per_row,
++            (block_turbo3_0 *)((char *)dst + row * row_size),
++            n_per_row
++        );
++    }
++    return nrows * row_size;
++}
++
++/* ---------- TURBO2_0: 2-bit PolarQuant (no QJL) ---------- */
++
++void quantize_row_turbo2_0_ref(const float * GGML_RESTRICT x, block_turbo2_0 * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_TURBO2 == 0);
++
++    extern int turbo3_cpu_wht_group_size;
++    int group_size = turbo3_cpu_wht_group_size;
++    if (group_size != 64 && group_size != 128) {
++        group_size = (k % 128 == 0) ? 128 : 64;
++    }
++    if (k % group_size != 0) group_size = (group_size == 128) ? 64 : 128;
++    assert(k % group_size == 0);
++
++    const int n_groups = k / group_size;
++    const int blocks_per_group = group_size / QK_TURBO2;
++
++    for (int g = 0; g < n_groups; g++) {
++        const float * grp_src = x + g * group_size;
++        block_turbo2_0 * grp_dst = y + g * blocks_per_group;
++
++        /* 1. L2 norm over the group */
++        float norm_sq = 0.0f;
++        float buf[128];
++        for (int j = 0; j < group_size; j++) {
++            buf[j] = grp_src[j];
++            norm_sq += buf[j] * buf[j];
++        }
++        float grp_norm = sqrtf(norm_sq);
++        float inv_norm = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
++
++        /* 2. Normalize */
++        for (int j = 0; j < group_size; j++) buf[j] *= inv_norm;
++
++        /* 3. Forward WHT rotation */
++        turbo_cpu_fwht(buf, group_size);
++
++        /* 4. Quantize + pack into sub-blocks */
++        float recon_sq = 0.0f;
++        for (int b = 0; b < blocks_per_group; b++) {
++            block_turbo2_0 * blk = &grp_dst[b];
++            const int off = b * QK_TURBO2;
++
++            memset(blk->qs, 0, QK_TURBO2 / 4);
++
++            for (int j = 0; j < QK_TURBO2; j++) {
++                int idx = nearest_centroid_2bit(buf[off + j]);
++                blk->qs[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
++                recon_sq += CENTROIDS_2BIT[idx] * CENTROIDS_2BIT[idx];
++            }
++        }
++
++        /* 5. Corrected norm */
++        float recon_norm = sqrtf(recon_sq);
++        float corrected = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
++        for (int b = 0; b < blocks_per_group; b++) {
++            grp_dst[b].norm = GGML_FP32_TO_FP16(corrected);
++        }
++    }
++}
++
++void dequantize_row_turbo2_0(const block_turbo2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_TURBO2 == 0);
++    const int nb = k / QK_TURBO2;
++    for (int block = 0; block < nb; block++) {
++        float norm = GGML_FP16_TO_FP32(x[block].norm);
++        for (int j = 0; j < QK_TURBO2; j++) {
++            uint8_t idx = (x[block].qs[j/4] >> ((j%4)*2)) & 0x3;
++            y[block * QK_TURBO2 + j] = CENTROIDS_2BIT[idx] * norm;
++        }
++    }
++}
++
++size_t quantize_turbo2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
++                         int64_t nrows, int64_t n_per_row, const float * imatrix) {
++    GGML_UNUSED(imatrix);
++    assert(n_per_row % QK_TURBO2 == 0);
++
++    size_t row_size = (n_per_row / QK_TURBO2) * sizeof(block_turbo2_0);
++    for (int64_t row = 0; row < nrows; row++) {
++        quantize_row_turbo2_0_ref(
++            src + row * n_per_row,
++            (block_turbo2_0 *)((char *)dst + row * row_size),
++            n_per_row
++        );
++    }
++    return nrows * row_size;
++}
++
++/* ---------- TURBO4_0: 3-bit PolarQuant + 1-bit QJL ---------- */
++
++void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * GGML_RESTRICT y, int64_t k) {
++    turbo_init_rotation();
++    turbo_init_qjl();
++
++    assert(k % QK_TURBO4 == 0);
++    const int nb = k / QK_TURBO4;
++    const int d  = QK_TURBO4;
++
++    for (int block = 0; block < nb; block++) {
++        const float * src = x + block * d;
++
++        /* Step 1: Extract norm */
++        float norm_sq = 0.0f;
++        for (int i = 0; i < d; i++) norm_sq += src[i] * src[i];
++        float norm = sqrtf(norm_sq);
++
++        /* Normalize */
++        float normalized[TURBO_D];
++        if (norm > 1e-10f) {
++            const float inv = 1.0f / norm;
++            for (int i = 0; i < d; i++) normalized[i] = src[i] * inv;
++        } else {
++            memset(normalized, 0, d * sizeof(float));
++        }
++
++        /* Step 2: Forward WHT rotation (matches CUDA set_rows) */
++        float rotated[TURBO_D];
++        memcpy(rotated, normalized, d * sizeof(float));
++        turbo_cpu_fwht(rotated, d);
++
++#if TURBO4_USE_4BIT
++        /* Step 3: 4-bit quantization (16 centroids) */
++        static const float CENTROIDS_4BIT[16] = {
++            -0.173926f, -0.117195f, -0.089527f, -0.068756f,
++            -0.051262f, -0.035597f, -0.020989f, -0.006938f,
++             0.006938f,  0.020989f,  0.035597f,  0.051262f,
++             0.068756f,  0.089527f,  0.117195f,  0.173926f
++        };
++        uint8_t indices[TURBO_D];
++        for (int i = 0; i < d; i++) {
++            indices[i] = (uint8_t)nearest_centroid_4bit(rotated[i]);
++        }
++
++        /* Norm correction */
++        float recon_norm_sq = 0.0f;
++        for (int i = 0; i < d; i++) {
++            recon_norm_sq += CENTROIDS_4BIT[indices[i]] * CENTROIDS_4BIT[indices[i]];
++        }
++        float recon_norm = sqrtf(recon_norm_sq);
++        float corrected_norm = (recon_norm > 1e-10f) ? norm / recon_norm : norm;
++        y[block].norm = GGML_FP32_TO_FP16(corrected_norm);
++#else
++        /* Step 3: 3-bit quantization (8 centroids) */
++        uint8_t indices[TURBO_D];
++        for (int i = 0; i < d; i++) {
++            indices[i] = (uint8_t)nearest_centroid_3bit(rotated[i]);
++        }
++
++        /* Step 4: Residual */
++        float reconstructed[TURBO_D];
++        for (int i = 0; i < d; i++) {
++            reconstructed[i] = CENTROIDS_3BIT[indices[i]];
++        }
++        float mse_recon[TURBO_D];
++        matvec(turbo_rotation_t, reconstructed, mse_recon, d);
++
++        float residual[TURBO_D];
++        for (int i = 0; i < d; i++) {
++            residual[i] = normalized[i] - mse_recon[i];
++        }
++
++        /* Step 5: QJL */
++        float projected[TURBO_D];
++        matvec(turbo_qjl_matrix, residual, projected, d);
++#endif
++
++        /* Pack */
++#if !TURBO4_USE_4BIT
++        y[block].norm  = GGML_FP32_TO_FP16(norm);
++#endif
++
++#if TURBO4_USE_4BIT
++        /* 4-bit PolarQuant: nibble pack into qs[64] */
++        memset(y[block].qs, 0, d / 2);
++        for (int i = 0; i < d; i++) {
++            y[block].qs[i / 2] |= (uint8_t)((indices[i] & 0xF) << ((i % 2) * 4));
++        }
++        y[block].rnorm = GGML_FP32_TO_FP16(0.0f);
++#else
++        /* Legacy 3-bit + QJL: pack 3-bit indices + QJL signs */
++        memset(y[block].qs, 0, d * 3 / 8);
++        for (int i = 0; i < d; i++) {
++            int bit_offset = i * 3;
++            int byte_idx   = bit_offset / 8;
++            int bit_pos    = bit_offset % 8;
++            uint16_t val   = (uint16_t)(indices[i] & 0x7);
++            y[block].qs[byte_idx] |= (uint8_t)(val << bit_pos);
++            if (bit_pos > 5 && byte_idx + 1 < d * 3 / 8) {
++                y[block].qs[byte_idx + 1] |= (uint8_t)(val >> (8 - bit_pos));
++            }
++        }
++        memset(y[block].signs, 0, d / 8);
++        for (int i = 0; i < d; i++) {
++            if (projected[i] >= 0.0f) {
++                y[block].signs[i / 8] |= (1 << (i % 8));
++            }
++        }
++#endif
++    }
++}
++
++void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    turbo_init_rotation();
++
++    assert(k % QK_TURBO4 == 0);
++    const int nb = k / QK_TURBO4;
++    const int d  = QK_TURBO4;
++
++#if TURBO4_USE_4BIT
++    /* 4-bit PolarQuant: nibble unpack → centroid → inverse rotate → scale */
++    /* TODO: add proper 4-bit centroid table to C code (currently only in Metal) */
++    static const float CENTROIDS_4BIT[16] = {
++        -0.173926f, -0.117195f, -0.089527f, -0.068756f,
++        -0.051262f, -0.035597f, -0.020989f, -0.006938f,
++         0.006938f,  0.020989f,  0.035597f,  0.051262f,
++         0.068756f,  0.089527f,  0.117195f,  0.173926f
++    };
++    for (int block = 0; block < nb; block++) {
++        float norm = GGML_FP16_TO_FP32(x[block].norm);
++        float * dst = y + block * d;
++        for (int i = 0; i < d; i++) {
++            uint8_t idx = (x[block].qs[i / 2] >> ((i % 2) * 4)) & 0xF;
++            dst[i] = CENTROIDS_4BIT[idx] * norm;
++        }
++        /* No inverse WHT, dequant stays in the rotated domain.
++        * Q is WHT-rotated by the graph, so <Q_rot, K_rot> gives correct attention scores.
++        * The inverse WHT is applied to the attention output via GGML_OP_TURBO_WHT (direction=1) in the graph.
++        */
++    }
++#else
++    /* Legacy 3-bit + QJL dequant */
++    turbo_init_qjl();
++    for (int block = 0; block < nb; block++) {
++        float norm  = GGML_FP16_TO_FP32(x[block].norm);
++
++        uint8_t indices[TURBO_D];
++        for (int i = 0; i < d; i++) {
++            int bit_offset = i * 3;
++            int byte_idx   = bit_offset / 8;
++            int bit_pos    = bit_offset % 8;
++            uint16_t raw   = (uint16_t)x[block].qs[byte_idx];
++            if (byte_idx + 1 < d * 3 / 8) {
++                raw |= (uint16_t)x[block].qs[byte_idx + 1] << 8;
++            }
++            indices[i] = (uint8_t)((raw >> bit_pos) & 0x7);
++        }
++
++        float signs[TURBO_D];
++        for (int i = 0; i < d; i++) {
++            signs[i] = (x[block].signs[i / 8] & (1 << (i % 8))) ? 1.0f : -1.0f;
++        }
++
++        float rnorm = GGML_FP16_TO_FP32(x[block].rnorm);
++        const float qjl_scale = TURBO_QJL_CONST / (float)d * rnorm;
++
++        float rotated_recon[TURBO_D];
++        for (int i = 0; i < d; i++) {
++            rotated_recon[i] = CENTROIDS_3BIT[indices[i]];
++        }
++        float mse_recon[TURBO_D];
++        matvec(turbo_rotation_t, rotated_recon, mse_recon, d);
++
++        float qjl_recon[TURBO_D];
++        matvec(turbo_qjl_matrix_t, signs, qjl_recon, d);
++        for (int i = 0; i < d; i++) {
++            qjl_recon[i] *= qjl_scale;
++        }
++
++        float * dst = y + block * d;
++        for (int i = 0; i < d; i++) {
++            dst[i] = (mse_recon[i] + qjl_recon[i]) * norm;
++        }
++    }
++#endif
++}
++
++size_t quantize_turbo4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
++                         int64_t nrows, int64_t n_per_row, const float * imatrix) {
++    GGML_UNUSED(imatrix);
++    assert(n_per_row % QK_TURBO4 == 0);
++
++    size_t row_size = (n_per_row / QK_TURBO4) * sizeof(block_turbo4_0);
++    for (int64_t row = 0; row < nrows; row++) {
++        quantize_row_turbo4_0_ref(
++            src + row * n_per_row,
++            (block_turbo4_0 *)((char *)dst + row * row_size),
++            n_per_row
++        );
++    }
++    return nrows * row_size;
++}
++
++/* ================================================================== */
++/* TQ3_1S / TQ4_1S: WHT-rotated weight quantization                  */
++/* ================================================================== */
++
++/* Lloyd-Max centroids for N(0,1) — shared with Metal shaders */
++static const float TQ3_0_CENTROIDS[8] = {
++    -1.996684f, -1.291398f, -0.740341f, -0.247508f,
++     0.230106f,  0.725222f,  1.277503f,  1.988943f
++};
++
++static const float TQ4_0_CENTROIDS[16] = {
++    -2.732590f, -2.069017f, -1.618046f, -1.256231f,
++    -0.942340f, -0.656759f, -0.388048f, -0.128395f,
++     0.128395f,  0.388048f,  0.656759f,  0.942340f,
++     1.256231f,  1.618046f,  2.069017f,  2.732590f,
++};
++
++/* WHT sign pattern (golden ratio hash, 32-element blocks) — shared by TQ3 and TQ4 */
++static const float TQ3_0_SIGNS[32] = {
++    +1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
++    -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
++    -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
++    -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
++};
++
++#define TQ_BLOCK_SIZE 32
++#define TQ_INV_SQRT32 0.17677669529663688f  /* 1/sqrt(32) */
++
++/* Forward RHT: sign flips -> WHT butterfly -> normalize */
++static void tq3_0_rht_forward(float * buf) {
++    for (int i = 0; i < TQ_BLOCK_SIZE; i++) buf[i] *= TQ3_0_SIGNS[i];
++    for (int step = 1; step < TQ_BLOCK_SIZE; step <<= 1) {
++        for (int i = 0; i < TQ_BLOCK_SIZE; i += step << 1) {
++            for (int j = i; j < i + step; j++) {
++                float a = buf[j], b = buf[j + step];
++                buf[j]     = a + b;
++                buf[j + step] = a - b;
++            }
++        }
++    }
++    for (int i = 0; i < TQ_BLOCK_SIZE; i++) buf[i] *= TQ_INV_SQRT32;
++}
++
++/* Inverse RHT: WHT butterfly -> normalize + unsign */
++static void tq3_0_rht_inverse(float * buf) {
++    for (int step = 1; step < TQ_BLOCK_SIZE; step <<= 1) {
++        for (int i = 0; i < TQ_BLOCK_SIZE; i += step << 1) {
++            for (int j = i; j < i + step; j++) {
++                float a = buf[j], b = buf[j + step];
++                buf[j]     = a + b;
++                buf[j + step] = a - b;
++            }
++        }
++    }
++    for (int i = 0; i < TQ_BLOCK_SIZE; i++) buf[i] *= TQ_INV_SQRT32 * TQ3_0_SIGNS[i];
++}
++
++/* Nearest centroid for TQ3 (8 centroids) */
++static int tq3_0_choose_index(float val) {
++    /* Binary search on midpoints of TQ3_0_CENTROIDS */
++    if (val < -1.644041f) return 0;
++    if (val < -1.015870f) return 1;
++    if (val < -0.493925f) return 2;
++    if (val < -0.008701f) return 3;
++    if (val <  0.477664f) return 4;
++    if (val <  1.001363f) return 5;
++    if (val <  1.633223f) return 6;
++    return 7;
++}
++
++/* Nearest centroid for TQ4 (16 centroids) */
++static int tq4_0_choose_index(float val) {
++    /* Binary search on midpoints of TQ4_0_CENTROIDS */
++    if (val < -2.400804f) return 0;
++    if (val < -1.843532f) return 1;
++    if (val < -1.437139f) return 2;
++    if (val < -1.099286f) return 3;
++    if (val < -0.799550f) return 4;
++    if (val < -0.522404f) return 5;
++    if (val < -0.258222f) return 6;
++    if (val <  0.000000f) return 7;
++    if (val <  0.258222f) return 8;
++    if (val <  0.522404f) return 9;
++    if (val <  0.799550f) return 10;
++    if (val <  1.099286f) return 11;
++    if (val <  1.437139f) return 12;
++    if (val <  1.843532f) return 13;
++    if (val <  2.400804f) return 14;
++    return 15;
++}
++
++/* ---------- TQ3_1S quantization ---------- */
++
++void quantize_row_tq3_1s_ref(const float * GGML_RESTRICT x, block_tq3_1s * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_TQ3_0 == 0);
++    const int nb = k / QK_TQ3_0;
++
++    for (int block = 0; block < nb; block++) {
++        const float * src_blk = x + block * QK_TQ3_0;
++        block_tq3_1s * blk = &y[block];
++
++        /* 1. Forward RHT */
++        float buf[TQ_BLOCK_SIZE];
++        memcpy(buf, src_blk, TQ_BLOCK_SIZE * sizeof(float));
++        tq3_0_rht_forward(buf);
++
++        /* 2. Split into two halves, compute RMS per half */
++        float rms0 = 0.0f, rms1 = 0.0f;
++        for (int j = 0; j < 16; j++) rms0 += buf[j] * buf[j];
++        for (int j = 16; j < 32; j++) rms1 += buf[j] * buf[j];
++        rms0 = sqrtf(rms0 / 16.0f);
++        rms1 = sqrtf(rms1 / 16.0f);
++
++        /* 3. Scale search (9 points) */
++        static const float scales[] = { 0.6f, 0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f, 1.35f, 1.5f };
++        float best_d0 = rms0, best_d1 = rms1;
++        float best_err = 1e30f;
++
++        for (int si = 0; si < 9; si++) {
++            float d0 = rms0 * scales[si];
++            float d1 = rms1 * scales[si];
++            float inv0 = (d0 > 1e-10f) ? 1.0f / d0 : 0.0f;
++            float inv1 = (d1 > 1e-10f) ? 1.0f / d1 : 0.0f;
++
++            float err = 0.0f;
++            for (int j = 0; j < 16; j++) {
++                int idx = tq3_0_choose_index(buf[j] * inv0);
++                float diff = buf[j] - TQ3_0_CENTROIDS[idx] * d0;
++                err += diff * diff;
++            }
++            for (int j = 16; j < 32; j++) {
++                int idx = tq3_0_choose_index(buf[j] * inv1);
++                float diff = buf[j] - TQ3_0_CENTROIDS[idx] * d1;
++                err += diff * diff;
++            }
++            if (err < best_err) {
++                best_err = err;
++                best_d0 = d0;
++                best_d1 = d1;
++            }
++        }
++
++        /* 4. Iterative refinement (6 iterations) */
++        for (int iter = 0; iter < 6; iter++) {
++            float inv0 = (best_d0 > 1e-10f) ? 1.0f / best_d0 : 0.0f;
++            float inv1 = (best_d1 > 1e-10f) ? 1.0f / best_d1 : 0.0f;
++
++            float num0 = 0.0f, den0 = 0.0f;
++            float num1 = 0.0f, den1 = 0.0f;
++            for (int j = 0; j < 16; j++) {
++                int idx = tq3_0_choose_index(buf[j] * inv0);
++                float c = TQ3_0_CENTROIDS[idx];
++                num0 += buf[j] * c;
++                den0 += c * c;
++            }
++            for (int j = 16; j < 32; j++) {
++                int idx = tq3_0_choose_index(buf[j] * inv1);
++                float c = TQ3_0_CENTROIDS[idx];
++                num1 += buf[j] * c;
++                den1 += c * c;
++            }
++            if (den0 > 1e-10f) best_d0 = num0 / den0;
++            if (den1 > 1e-10f) best_d1 = num1 / den1;
++        }
++
++        /* 5. Final quantize + pack */
++        float inv0 = (best_d0 > 1e-10f) ? 1.0f / best_d0 : 0.0f;
++        float inv1 = (best_d1 > 1e-10f) ? 1.0f / best_d1 : 0.0f;
++
++        blk->d0 = GGML_FP32_TO_FP16(best_d0);
++        blk->d1 = GGML_FP32_TO_FP16(best_d1);
++        memset(blk->qs, 0, QK_TQ3_0 * 3 / 8);
++
++        /* TQ3 packing: 4 groups of 8 indices packed into 3 bytes each */
++        for (int g = 0; g < 4; g++) {
++            uint8_t indices[8];
++            for (int i = 0; i < 8; i++) {
++                int j = g * 8 + i;
++                float inv = (j < 16) ? inv0 : inv1;
++                indices[i] = (uint8_t)tq3_0_choose_index(buf[j] * inv);
++            }
++            uint8_t * qp = blk->qs + g * 3;
++            qp[0] = (indices[0] & 7) | ((indices[1] & 7) << 3) | ((indices[2] & 3) << 6);
++            qp[1] = ((indices[2] >> 2) & 1) | ((indices[3] & 7) << 1) | ((indices[4] & 7) << 4) | ((indices[5] & 1) << 7);
++            qp[2] = ((indices[5] >> 1) & 3) | ((indices[6] & 7) << 2) | ((indices[7] & 7) << 5);
++        }
++    }
++}
++
++void dequantize_row_tq3_1s(const block_tq3_1s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_TQ3_0 == 0);
++    const int nb = k / QK_TQ3_0;
++
++    for (int blk_i = 0; blk_i < nb; blk_i++) {
++        float d0 = GGML_FP16_TO_FP32(x[blk_i].d0);
++        float d1 = GGML_FP16_TO_FP32(x[blk_i].d1);
++
++        /* Unpack 3-bit indices */
++        float buf[32];
++        for (int g = 0; g < 4; g++) {
++            const uint8_t * qp = x[blk_i].qs + g * 3;
++            uint8_t idx[8];
++            idx[0] =  qp[0]       & 7;
++            idx[1] = (qp[0] >> 3) & 7;
++            idx[2] = ((qp[0] >> 6) | (qp[1] << 2)) & 7;
++            idx[3] = (qp[1] >> 1) & 7;
++            idx[4] = (qp[1] >> 4) & 7;
++            idx[5] = ((qp[1] >> 7) | (qp[2] << 1)) & 7;
++            idx[6] = (qp[2] >> 2) & 7;
++            idx[7] = (qp[2] >> 5) & 7;
++
++            for (int i = 0; i < 8; i++) {
++                int j = g * 8 + i;
++                float d = (j < 16) ? d0 : d1;
++                buf[j] = TQ3_0_CENTROIDS[idx[i]] * d;
++            }
++        }
++
++        /* Inverse RHT */
++        tq3_0_rht_inverse(buf);
++
++        memcpy(y + blk_i * QK_TQ3_0, buf, QK_TQ3_0 * sizeof(float));
++    }
++}
++
++size_t quantize_tq3_1s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
++                        int64_t nrows, int64_t n_per_row, const float * imatrix) {
++    GGML_UNUSED(imatrix);
++    assert(n_per_row % QK_TQ3_0 == 0);
++
++    size_t row_size = (n_per_row / QK_TQ3_0) * sizeof(block_tq3_1s);
++    for (int64_t row = 0; row < nrows; row++) {
++        quantize_row_tq3_1s_ref(
++            src + row * n_per_row,
++            (block_tq3_1s *)((char *)dst + row * row_size),
++            n_per_row
++        );
++    }
++    return nrows * row_size;
++}
++
++/* ---------- TQ4_1S quantization ---------- */
++
++void quantize_row_tq4_1s_ref(const float * GGML_RESTRICT x, block_tq4_1s * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_TQ4_1S == 0);
++    const int nb = k / QK_TQ4_1S;
++
++    for (int block = 0; block < nb; block++) {
++        const float * src_blk = x + block * QK_TQ4_1S;
++        block_tq4_1s * blk = &y[block];
++
++        /* 1. Forward RHT */
++        float buf[TQ_BLOCK_SIZE];
++        memcpy(buf, src_blk, TQ_BLOCK_SIZE * sizeof(float));
++        tq3_0_rht_forward(buf);
++
++        /* 2. Split into two halves, compute RMS per half */
++        float rms0 = 0.0f, rms1 = 0.0f;
++        for (int j = 0; j < 16; j++) rms0 += buf[j] * buf[j];
++        for (int j = 16; j < 32; j++) rms1 += buf[j] * buf[j];
++        rms0 = sqrtf(rms0 / 16.0f);
++        rms1 = sqrtf(rms1 / 16.0f);
++
++        /* 3. Scale search (9 points) */
++        static const float scales[] = { 0.6f, 0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f, 1.35f, 1.5f };
++        float best_d0 = rms0, best_d1 = rms1;
++        float best_err = 1e30f;
++
++        for (int si = 0; si < 9; si++) {
++            float d0 = rms0 * scales[si];
++            float d1 = rms1 * scales[si];
++            float inv0 = (d0 > 1e-10f) ? 1.0f / d0 : 0.0f;
++            float inv1 = (d1 > 1e-10f) ? 1.0f / d1 : 0.0f;
++
++            float err = 0.0f;
++            for (int j = 0; j < 16; j++) {
++                int idx = tq4_0_choose_index(buf[j] * inv0);
++                float diff = buf[j] - TQ4_0_CENTROIDS[idx] * d0;
++                err += diff * diff;
++            }
++            for (int j = 16; j < 32; j++) {
++                int idx = tq4_0_choose_index(buf[j] * inv1);
++                float diff = buf[j] - TQ4_0_CENTROIDS[idx] * d1;
++                err += diff * diff;
++            }
++            if (err < best_err) {
++                best_err = err;
++                best_d0 = d0;
++                best_d1 = d1;
++            }
++        }
++
++        /* 4. Iterative refinement (6 iterations) */
++        for (int iter = 0; iter < 6; iter++) {
++            float inv0 = (best_d0 > 1e-10f) ? 1.0f / best_d0 : 0.0f;
++            float inv1 = (best_d1 > 1e-10f) ? 1.0f / best_d1 : 0.0f;
++
++            float num0 = 0.0f, den0 = 0.0f;
++            float num1 = 0.0f, den1 = 0.0f;
++            for (int j = 0; j < 16; j++) {
++                int idx = tq4_0_choose_index(buf[j] * inv0);
++                float c = TQ4_0_CENTROIDS[idx];
++                num0 += buf[j] * c;
++                den0 += c * c;
++            }
++            for (int j = 16; j < 32; j++) {
++                int idx = tq4_0_choose_index(buf[j] * inv1);
++                float c = TQ4_0_CENTROIDS[idx];
++                num1 += buf[j] * c;
++                den1 += c * c;
++            }
++            if (den0 > 1e-10f) best_d0 = num0 / den0;
++            if (den1 > 1e-10f) best_d1 = num1 / den1;
++        }
++
++        /* 5. Final quantize + pack (nibble packing) */
++        float inv0 = (best_d0 > 1e-10f) ? 1.0f / best_d0 : 0.0f;
++        float inv1 = (best_d1 > 1e-10f) ? 1.0f / best_d1 : 0.0f;
++
++        blk->d0 = GGML_FP32_TO_FP16(best_d0);
++        blk->d1 = GGML_FP32_TO_FP16(best_d1);
++        memset(blk->qs, 0, QK_TQ4_1S / 2);
++
++        for (int j = 0; j < QK_TQ4_1S; j++) {
++            float inv = (j < 16) ? inv0 : inv1;
++            int idx = tq4_0_choose_index(buf[j] * inv);
++            blk->qs[j / 2] |= (uint8_t)((idx & 0xF) << ((j & 1) * 4));
++        }
++    }
++}
++
++void dequantize_row_tq4_1s(const block_tq4_1s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_TQ4_1S == 0);
++    const int nb = k / QK_TQ4_1S;
++
++    for (int blk_i = 0; blk_i < nb; blk_i++) {
++        float d0 = GGML_FP16_TO_FP32(x[blk_i].d0);
++        float d1 = GGML_FP16_TO_FP32(x[blk_i].d1);
++
++        float buf[32];
++        for (int j = 0; j < 32; j++) {
++            uint8_t idx = (x[blk_i].qs[j / 2] >> ((j & 1) * 4)) & 0xF;
++            float d = (j < 16) ? d0 : d1;
++            buf[j] = TQ4_0_CENTROIDS[idx] * d;
++        }
++
++        /* Inverse RHT */
++        tq3_0_rht_inverse(buf);
++
++        memcpy(y + blk_i * QK_TQ4_1S, buf, QK_TQ4_1S * sizeof(float));
++    }
++}
++
++size_t quantize_tq4_1s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
++                        int64_t nrows, int64_t n_per_row, const float * imatrix) {
++    GGML_UNUSED(imatrix);
++    assert(n_per_row % QK_TQ4_1S == 0);
++
++    size_t row_size = (n_per_row / QK_TQ4_1S) * sizeof(block_tq4_1s);
++    for (int64_t row = 0; row < nrows; row++) {
++        quantize_row_tq4_1s_ref(
++            src + row * n_per_row,
++            (block_tq4_1s *)((char *)dst + row * row_size),
++            n_per_row
++        );
++    }
++    return nrows * row_size;
++}
+diff --git a/tests/test-turbo-quant.c b/tests/test-turbo-quant.c
+new file mode 100644
+index 000000000..789bdfb6d
+--- /dev/null
++++ b/tests/test-turbo-quant.c
+@@ -0,0 +1,125 @@
++#include "ggml-quants.h"
++
++#include <math.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++extern void turbo_cpu_fwht_inverse(float * x, int group_size);
++
++static uint32_t rng_state = 0x12345678u;
++
++static float next_value(void) {
++    rng_state = rng_state*1664525u + 1013904223u;
++    return ((float) (rng_state >> 8)/(float) 0x00ffffffu)*2.0f - 1.0f;
++}
++
++static void inverse_groups(float * values, int n) {
++    for (int i = 0; i < n; i += 128) {
++        turbo_cpu_fwht_inverse(values + i, 128);
++    }
++}
++
++static float cosine(const float * a, const float * b, int n) {
++    double dot = 0.0;
++    double na = 0.0;
++    double nb = 0.0;
++    for (int i = 0; i < n; ++i) {
++        dot += (double) a[i]*b[i];
++        na += (double) a[i]*a[i];
++        nb += (double) b[i]*b[i];
++    }
++    return na > 0.0 && nb > 0.0 ? (float) (dot/sqrt(na*nb)) : 1.0f;
++}
++
++static float relative_norm_error(const float * a, const float * b, int n) {
++    double na = 0.0;
++    double nb = 0.0;
++    for (int i = 0; i < n; ++i) {
++        na += (double) a[i]*a[i];
++        nb += (double) b[i]*b[i];
++    }
++    return na > 0.0 ? (float) fabs(sqrt(nb/na) - 1.0) : (float) sqrt(nb);
++}
++
++static void fill_values(float * values, int n, int pattern) {
++    for (int i = 0; i < n; ++i) {
++        switch (pattern) {
++            case 0: values[i] = 0.0f; break;
++            case 1: values[i] = sinf((float) i*0.071f)*10.0f; break;
++            case 2: values[i] = next_value(); break;
++            default: values[i] = (i % 29 == 0) ? 25.0f : next_value()*0.05f; break;
++        }
++    }
++}
++
++static int test_turbo3(int n, int pattern) {
++    const size_t bytes = (size_t) (n/QK_TURBO3)*sizeof(block_turbo3_0);
++    float * input = (float *) malloc((size_t) n*sizeof(float));
++    float * output = (float *) malloc((size_t) n*sizeof(float));
++    block_turbo3_0 * q0 = (block_turbo3_0 *) calloc(1, bytes);
++    block_turbo3_0 * q1 = (block_turbo3_0 *) calloc(1, bytes);
++    if (!input || !output || !q0 || !q1) return 1;
++
++    fill_values(input, n, pattern);
++    quantize_row_turbo3_0_ref(input, q0, n);
++    quantize_row_turbo3_0_ref(input, q1, n);
++    dequantize_row_turbo3_0(q0, output, n);
++    inverse_groups(output, n);
++
++    const float cos = cosine(input, output, n);
++    const float norm_err = relative_norm_error(input, output, n);
++    const int failed = memcmp(q0, q1, bytes) != 0 || cos < 0.90f || norm_err > 0.002f;
++    if (failed) fprintf(stderr, "turbo3 n=%d pattern=%d cosine=%g norm_err=%g\n", n, pattern, cos, norm_err);
++
++    free(q1);
++    free(q0);
++    free(output);
++    free(input);
++    return failed;
++}
++
++static int test_turbo4(int n, int pattern) {
++    const size_t bytes = (size_t) (n/QK_TURBO4)*sizeof(block_turbo4_0);
++    float * input = (float *) malloc((size_t) n*sizeof(float));
++    float * output = (float *) malloc((size_t) n*sizeof(float));
++    block_turbo4_0 * q0 = (block_turbo4_0 *) calloc(1, bytes);
++    block_turbo4_0 * q1 = (block_turbo4_0 *) calloc(1, bytes);
++    if (!input || !output || !q0 || !q1) return 1;
++
++    fill_values(input, n, pattern);
++    quantize_row_turbo4_0_ref(input, q0, n);
++    quantize_row_turbo4_0_ref(input, q1, n);
++    dequantize_row_turbo4_0(q0, output, n);
++    inverse_groups(output, n);
++
++    const float cos = cosine(input, output, n);
++    const float norm_err = relative_norm_error(input, output, n);
++    const int failed = memcmp(q0, q1, bytes) != 0 || cos < 0.97f || norm_err > 0.002f;
++    if (failed) fprintf(stderr, "turbo4 n=%d pattern=%d cosine=%g norm_err=%g\n", n, pattern, cos, norm_err);
++
++    free(q1);
++    free(q0);
++    free(output);
++    free(input);
++    return failed;
++}
++
++int main(void) {
++    int failed = 0;
++    const int dimensions[] = {128, 256, 384, 512, 640};
++    for (size_t i = 0; i < sizeof(dimensions)/sizeof(dimensions[0]); ++i) {
++        const int n = dimensions[i];
++        for (int pattern = 0; pattern < 4; ++pattern) {
++            failed += test_turbo3(n, pattern);
++            failed += test_turbo4(n, pattern);
++        }
++    }
++    if (failed) {
++        fprintf(stderr, "%d TurboQuant checks failed\n", failed);
++        return 1;
++    }
++    printf("TurboQuant CPU suite passed\n");
++    return 0;
++}
+diff --git a/tosh-moe/tosh-moe-cache.cpp b/tosh-moe/tosh-moe-cache.cpp
+new file mode 100644
+index 000000000..c2a583a93
+--- /dev/null
++++ b/tosh-moe/tosh-moe-cache.cpp
+@@ -0,0 +1,579 @@
++#include "tosh-moe.h"
++
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++// Allocated once: a step must not allocate, or a long session creeps upwards.
++struct tosh_moe_cache {
++    int n_layer = 0;
++    int n_expert = 0;
++    int n_slots = 0;
++    int n_fixed = 0;
++
++    uint64_t tick = 1;   // advances once per step
++
++    std::vector<int32_t>  slot_of;    // [layer][expert] -> slot, or -1
++    std::vector<int32_t>  expert_of;  // [layer][slot]   -> expert, or -1
++    std::vector<uint64_t> used_at;    // [layer][slot]   -> tick of last use
++    std::vector<uint64_t> held_at;    // [layer][slot]   -> tick it is held for, 0 when free
++
++    tosh_moe_cache_stats stats = {};
++};
++
++static inline size_t idx_e(const tosh_moe_cache * c, int il, int expert) {
++    return (size_t) il*c->n_expert + expert;
++}
++
++static inline size_t idx_s(const tosh_moe_cache * c, int il, int slot) {
++    return (size_t) il*c->n_slots + slot;
++}
++
++struct tosh_moe_cache * tosh_moe_cache_init_fixed(int n_layer, int n_expert, int n_slots, int n_fixed) {
++    if (n_layer <= 0 || n_expert <= 0 || n_slots <= 0 || n_slots > n_expert ||
++        n_fixed < 0 || n_fixed > n_slots) {
++        return nullptr;
++    }
++
++    auto * c = new tosh_moe_cache();
++
++    c->n_layer  = n_layer;
++    c->n_expert = n_expert;
++    c->n_slots  = n_slots;
++    c->n_fixed  = n_fixed;
++
++    c->slot_of  .assign((size_t) n_layer*n_expert, -1);
++    c->expert_of.assign((size_t) n_layer*n_slots,  -1);
++    c->used_at  .assign((size_t) n_layer*n_slots,   0);
++    c->held_at  .assign((size_t) n_layer*n_slots,   0);
++
++    // Split banks place the first K experts permanently in the first K GPU slots.
++    // Seed that mapping once and keep only the trailing ring eligible for eviction.
++    for (int il = 0; il < n_layer; ++il) {
++        for (int e = 0; e < n_fixed; ++e) {
++            c->slot_of[idx_e(c, il, e)] = e;
++            c->expert_of[idx_s(c, il, e)] = e;
++            c->used_at[idx_s(c, il, e)] = c->tick;
++        }
++    }
++
++    return c;
++}
++
++struct tosh_moe_cache * tosh_moe_cache_init(int n_layer, int n_expert, int n_slots) {
++    return tosh_moe_cache_init_fixed(n_layer, n_expert, n_slots, 0);
++}
++
++void tosh_moe_cache_set_fixed(struct tosh_moe_cache * c, int il, const int32_t * experts, int n) {
++    if (!c || il < 0 || il >= c->n_layer || !experts || n != c->n_fixed) return;
++    for (int e = 0; e < c->n_expert; ++e) c->slot_of[idx_e(c, il, e)] = -1;
++    for (int s = 0; s < c->n_fixed; ++s) {
++        c->expert_of[idx_s(c, il, s)] = -1;
++        const int e = experts[s];
++        if (e < 0 || e >= c->n_expert) continue;
++        c->slot_of[idx_e(c, il, e)] = s;
++        c->expert_of[idx_s(c, il, s)] = e;
++        c->used_at[idx_s(c, il, s)] = c->tick;
++    }
++}
++
++void tosh_moe_cache_free(struct tosh_moe_cache * c) {
++    delete c;
++}
++
++int tosh_moe_cache_find(const struct tosh_moe_cache * c, int il, int expert) {
++    if (!c || il < 0 || il >= c->n_layer || expert < 0 || expert >= c->n_expert) {
++        return -1;
++    }
++
++    return c->slot_of[idx_e(c, il, expert)];
++}
++
++int tosh_moe_cache_hold(struct tosh_moe_cache * c, int il, int expert) {
++    if (!c || il < 0 || il >= c->n_layer || expert < 0 || expert >= c->n_expert) {
++        return -1;
++    }
++
++    c->stats.lookups++;
++
++    const int slot = c->slot_of[idx_e(c, il, expert)];
++    if (slot < 0) {
++        return -1;
++    }
++
++    c->stats.hits++;
++
++    c->used_at[idx_s(c, il, slot)] = c->tick;
++    c->held_at[idx_s(c, il, slot)] = c->tick;
++
++    return slot;
++}
++
++int tosh_moe_cache_admit(struct tosh_moe_cache * c, int il, int expert, int * out_evicted) {
++    if (out_evicted) {
++        *out_evicted = -1;
++    }
++
++    if (!c || il < 0 || il >= c->n_layer || expert < 0 || expert >= c->n_expert) {
++        return -1;
++    }
++
++    // admitting a resident expert again would give it a second slot
++    const int cur = c->slot_of[idx_e(c, il, expert)];
++    if (cur >= 0) {
++        return tosh_moe_cache_hold(c, il, expert);
++    }
++
++    // a free slot first, then the least recently used one that nothing holds
++    int victim = -1;
++    for (int s = c->n_fixed; s < c->n_slots; s++) {
++        if (c->expert_of[idx_s(c, il, s)] < 0) {
++            victim = s;
++            break;
++        }
++    }
++
++    if (victim < 0) {
++        for (int s = c->n_fixed; s < c->n_slots; s++) {
++            if (c->held_at[idx_s(c, il, s)] == c->tick) {
++                continue;   // in use this step
++            }
++            if (victim < 0 || c->used_at[idx_s(c, il, s)] < c->used_at[idx_s(c, il, victim)]) {
++                victim = s;
++            }
++        }
++    }
++
++    if (victim < 0) {
++        c->stats.starved++;
++        return -1;
++    }
++
++    const int old = c->expert_of[idx_s(c, il, victim)];
++    if (old >= 0) {
++        c->slot_of[idx_e(c, il, old)] = -1;
++        c->stats.evictions++;
++        if (out_evicted) {
++            *out_evicted = old;
++        }
++    }
++
++    c->expert_of[idx_s(c, il, victim)] = expert;
++    c->slot_of  [idx_e(c, il, expert)] = victim;
++    c->used_at  [idx_s(c, il, victim)] = c->tick;
++    c->held_at  [idx_s(c, il, victim)] = c->tick;
++
++    c->stats.admits++;
++
++    return victim;
++}
++
++void tosh_moe_cache_step(struct tosh_moe_cache * c) {
++    if (!c) {
++        return;
++    }
++
++    // holds carry the tick they were taken on, so the clock releases them all at once
++    c->tick++;
++    c->stats.steps++;
++}
++
++bool tosh_moe_cache_check(const struct tosh_moe_cache * c, const char ** why) {
++    const auto fail = [&](const char * msg) {
++        if (why) {
++            *why = msg;
++        }
++        return false;
++    };
++
++    if (!c) {
++        return fail("no cache");
++    }
++
++    for (int il = 0; il < c->n_layer; il++) {
++        for (int e = 0; e < c->n_expert; e++) {
++            const int s = c->slot_of[idx_e(c, il, e)];
++            if (s == -1) {
++                continue;
++            }
++            if (s < 0 || s >= c->n_slots) {
++                return fail("an expert points outside the slot range");
++            }
++            if (c->expert_of[idx_s(c, il, s)] != e) {
++                return fail("an expert points at a slot that does not point back");
++            }
++        }
++
++        for (int s = 0; s < c->n_slots; s++) {
++            const int e = c->expert_of[idx_s(c, il, s)];
++            if (e == -1) {
++                continue;
++            }
++            if (e < 0 || e >= c->n_expert) {
++                return fail("a slot points outside the expert range");
++            }
++            if (c->slot_of[idx_e(c, il, e)] != s) {
++                return fail("a slot holds an expert that lives somewhere else");
++            }
++            if (c->held_at[idx_s(c, il, s)] > c->tick) {
++                return fail("a slot is held for a step that has not happened");
++            }
++        }
++    }
++
++    return true;
++}
++
++void tosh_moe_cache_stats_get(const struct tosh_moe_cache * c, struct tosh_moe_cache_stats * out) {
++    if (!c || !out) {
++        return;
++    }
++
++    *out = c->stats;
++}
++
++#include <algorithm>
++#include <cstdio>
++#include <string>
++#include <unordered_map>
++
++enum tosh_moe_mode tosh_moe_mode(void) {
++    static const enum tosh_moe_mode m = []() {
++        const char * s = getenv("TOSH_MOE_MODE");
++        if (!s || strcmp(s, "off") == 0) {
++            return TOSH_MOE_OFF;
++        }
++        if (strcmp(s, "cache") == 0) {
++            return TOSH_MOE_CACHE;
++        }
++        if (strcmp(s, "hybrid") == 0) {
++            return TOSH_MOE_HYBRID;
++        }
++        return TOSH_MOE_OFF;
++    }();
++
++    return m;
++}
++
++int tosh_moe_slots_want(void) {
++    static const int n = []() {
++        if (tosh_moe_mode() == TOSH_MOE_OFF) {
++            return 0;
++        }
++        const char * s = getenv("TOSH_MOE_SLOTS");
++        const int v = s ? atoi(s) : 0;
++        return v > 0 ? v : 0;
++    }();
++
++    return n;
++}
++
++// keyed by pointer, so it has to be dropped when a model goes away or a later load can hit a
++// freed tensor that happens to land on the same address
++static std::unordered_map<const void *, const void *> g_bind;
++static std::unordered_map<const void *, const void *> g_slots_of;
++static std::unordered_map<const void *, int> g_experts;
++static std::unordered_map<const void *, int> g_fixed;
++static const void * g_stage;
++static std::unordered_map<const void *, int> g_layer_of;
++static std::unordered_map<int, std::vector<uint32_t>> g_seen;   // layer -> uses per expert
++static std::unordered_map<int, std::vector<int32_t>> g_hot;
++static std::unordered_map<int, std::vector<int32_t>> g_cold_for;
++
++static void tosh_moe_tables_clear(void);
++static void tosh_moe_layers_clear(void);
++static void tosh_moe_rounds_clear(void);
++static void tosh_moe_state_clear(void);
++
++void tosh_moe_bind(const void * slots, const void * ram) {
++    g_bind[slots] = ram;
++    g_slots_of[ram] = slots;
++}
++
++const void * tosh_moe_ram_of(const void * slots) {
++    const auto it = g_bind.find(slots);
++    return it == g_bind.end() ? nullptr : it->second;
++}
++
++void tosh_moe_bind_experts(const void * slots, int n_expert) {
++    g_experts[slots] = n_expert;
++}
++
++int tosh_moe_experts_of(const void * slots) {
++    const auto it = g_experts.find(slots);
++    return it == g_experts.end() ? 0 : it->second;
++}
++
++void tosh_moe_bind_fixed(const void * slots, int n_fixed) {
++    g_fixed[slots] = n_fixed;
++}
++
++int tosh_moe_fixed_of(const void * slots) {
++    const auto it = g_fixed.find(slots);
++    return it == g_fixed.end() ? 0 : it->second;
++}
++
++void tosh_moe_seen_dump(void) {
++    if (const char * path = getenv("TOSH_MOE_HOT_MAP_OUT")) {
++        const std::string temporary = std::string(path) + ".tmp";
++        FILE * fp = fopen(temporary.c_str(), "w");
++        if (fp) {
++            const int want = std::max(1, getenv("TOSH_MOE_HOT_MAP_K") ? atoi(getenv("TOSH_MOE_HOT_MAP_K")) : 75);
++            std::vector<int> order;
++            for (const auto & kv : g_seen) {
++                order.resize(kv.second.size());
++                for (int e = 0; e < (int) order.size(); ++e) order[e] = e;
++                std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
++                    return kv.second[a] > kv.second[b];
++                });
++                fprintf(fp, "%d", kv.first);
++                for (int i = 0; i < want && i < (int) order.size(); ++i) {
++                    const int e = order[i];
++                    fprintf(fp, " %d:%u", e, kv.second[e]);
++                }
++                fputc('\n', fp);
++            }
++            const bool flushed = fflush(fp) == 0;
++            const bool closed = fclose(fp) == 0;
++            const bool ok = flushed && closed;
++            if (ok) {
++                if (rename(temporary.c_str(), path) != 0) remove(temporary.c_str());
++            } else {
++                remove(temporary.c_str());
++            }
++        }
++    }
++}
++
++void tosh_moe_seen_seed(int il, const int32_t * experts, const uint32_t * counts, int n) {
++    auto & seen = g_seen[il];
++    if (seen.empty() || !std::all_of(seen.begin(), seen.end(), [](uint32_t value) { return value == 0; })) {
++        return;
++    }
++
++    uint32_t peak = 1;
++    for (int i = 0; i < n; ++i) peak = std::max(peak, counts[i]);
++
++    // Carry history forward with bounded weight. New routing can replace stale habits
++    // within a normal session, while short sessions no longer erase the accumulated map.
++    constexpr uint32_t history_peak = 32;
++    for (int i = 0; i < n; ++i) {
++        const int e = experts[i];
++        if (e < 0 || e >= (int) seen.size()) continue;
++        const uint64_t scaled = (uint64_t) counts[i]*history_peak + peak - 1;
++        seen[e] = std::max(1u, (uint32_t) (scaled/peak));
++    }
++}
++
++void tosh_moe_unbind_all(void) {
++    tosh_moe_seen_dump();
++    g_bind.clear();
++    g_slots_of.clear();
++    g_experts.clear();
++    g_fixed.clear();
++    g_stage = nullptr;
++    tosh_moe_state_clear();
++    tosh_moe_layers_clear();
++    tosh_moe_tables_clear();
++}
++
++struct tosh_moe_table {
++    std::vector<int32_t> slot_of;
++};
++
++static std::unordered_map<const void *, tosh_moe_table> g_tables;
++
++void tosh_moe_table_set(const void * slots, const int32_t * table, int n_expert) {
++    auto & t = g_tables[slots];
++    t.slot_of.assign(table, table + n_expert);
++
++    // reachable from the RAM twin as well, so the host path finds it without another lookup
++    const void * ram = tosh_moe_ram_of(slots);
++    if (ram) {
++        g_tables[ram].slot_of = t.slot_of;
++    }
++}
++
++const int32_t * tosh_moe_table_of(const void * tensor, int * n_expert) {
++    const auto it = g_tables.find(tensor);
++    if (it == g_tables.end() || it->second.slot_of.empty()) {
++        return nullptr;
++    }
++
++    if (n_expert) {
++        *n_expert = (int) it->second.slot_of.size();
++    }
++
++    return it->second.slot_of.data();
++}
++
++static void tosh_moe_tables_clear(void) {
++    g_tables.clear();
++}
++
++// A bank belongs to a layer, and the three of a layer move together: an expert that is only
++// half resident cannot run.
++void tosh_moe_layer_set(const void * tensor, int il, int n_expert) {
++    g_layer_of[tensor] = il;
++
++    auto & v = g_seen[il];
++    if ((int) v.size() < n_expert) {
++        v.assign(n_expert, 0);
++    }
++}
++
++int tosh_moe_layer_of(const void * tensor) {
++    const auto it = g_layer_of.find(tensor);
++    return it == g_layer_of.end() ? -1 : it->second;
++}
++
++void tosh_moe_hot_set(int il, const int32_t * experts, int n) {
++    g_hot[il].assign(experts, experts + n);
++
++    // Preserve a small prior for the resident set loaded from the previous profile.
++    // Real routing observations overtake it quickly, but a one-token session cannot
++    // erase the whole ranking by leaving every unused expert tied at zero.
++    auto & seen = g_seen[il];
++    const bool empty = std::all_of(seen.begin(), seen.end(), [](uint32_t value) { return value == 0; });
++    if (empty) {
++        for (int i = 0; i < n; ++i) {
++            const int e = experts[i];
++            if (e >= 0 && e < (int) seen.size()) seen[e] = 2;
++        }
++    }
++}
++
++const int32_t * tosh_moe_hot_of(int il, int * n) {
++    const auto it = g_hot.find(il);
++    if (it == g_hot.end()) return nullptr;
++    if (n) *n = (int) it->second.size();
++    return it->second.data();
++}
++
++void tosh_moe_cold_set(int il, const int32_t * cold_for, int n) {
++    g_cold_for[il].assign(cold_for, cold_for + n);
++}
++
++int tosh_moe_cold_of(int il, int expert) {
++    const auto it = g_cold_for.find(il);
++    if (it == g_cold_for.end() || expert < 0 || expert >= (int) it->second.size()) return -1;
++    return it->second[expert];
++}
++
++void tosh_moe_observe(const void * tensor, const int32_t * ids, int n) {
++    const int il = tosh_moe_layer_of(tensor);
++    if (il < 0) {
++        return;
++    }
++
++    auto & v = g_seen[il];
++    for (int i = 0; i < n; i++) {
++        const int32_t e = ids[i];
++        if (e >= 0 && e < (int32_t) v.size()) {
++            v[e]++;
++        }
++    }
++}
++
++const uint32_t * tosh_moe_seen_of(int il, int * n) {
++    const auto it = g_seen.find(il);
++    if (it == g_seen.end()) {
++        return nullptr;
++    }
++    if (n) {
++        *n = (int) it->second.size();
++    }
++    return it->second.data();
++}
++
++void tosh_moe_seen_clear(int il) {
++    const auto it = g_seen.find(il);
++    if (it != g_seen.end()) {
++        std::fill(it->second.begin(), it->second.end(), 0u);
++    }
++}
++
++int tosh_moe_bind_count(void) {
++    return (int) g_bind.size();
++}
++
++void tosh_moe_bind_at(int i, const void ** slots, const void ** ram) {
++    int k = 0;
++    for (const auto & kv : g_bind) {
++        if (k++ != i) {
++            continue;
++        }
++        if (slots) { *slots = kv.first;  }
++        if (ram)   { *ram   = kv.second; }
++        return;
++    }
++}
++
++
++static void tosh_moe_layers_clear(void) {
++    g_layer_of.clear();
++    g_seen.clear();
++    g_hot.clear();
++    g_cold_for.clear();
++    tosh_moe_rounds_clear();
++}
++
++static const void * g_host_buft = nullptr;
++
++void tosh_moe_set_host_buft(const void * buft) {
++    g_host_buft = buft;
++}
++
++const void * tosh_moe_host_buft(void) {
++    return g_host_buft;
++}
++
++static std::unordered_map<const void *, const void *> g_state;
++
++void tosh_moe_bind_state(const void * slots, const void * state) {
++    g_state[slots] = state;
++}
++
++const void * tosh_moe_state_of(const void * slots) {
++    const auto it = g_state.find(slots);
++    return it == g_state.end() ? nullptr : it->second;
++}
++
++
++static void tosh_moe_state_clear(void) {
++    g_state.clear();
++}
++
++static std::unordered_map<int, int> g_round;      // layer -> last node index seen
++
++bool tosh_moe_should_route(const void * slots, int node_idx) {
++    const int il = tosh_moe_layer_of(slots);
++    if (il < 0) {
++        return false;
++    }
++
++    const auto it = g_round.find(il);
++    const bool first = it == g_round.end() || node_idx <= it->second;
++
++    g_round[il] = node_idx;
++
++    return first;
++}
++
++
++static void tosh_moe_rounds_clear(void) {
++    g_round.clear();
++}
++
++const void * tosh_moe_slots_of(const void * bank) {
++    const auto it = g_slots_of.find(bank);
++    return it == g_slots_of.end() ? nullptr : it->second;
++}
++
++void tosh_moe_set_stage(const void * stage) {
++    g_stage = stage;
++}
++
++const void * tosh_moe_stage(void) {
++    return g_stage;
++}
+diff --git a/tosh-moe/tosh-moe-fill.cpp b/tosh-moe/tosh-moe-fill.cpp
+new file mode 100644
+index 000000000..235508a7c
+--- /dev/null
++++ b/tosh-moe/tosh-moe-fill.cpp
+@@ -0,0 +1,164 @@
++#include "tosh-moe.h"
++
++#include "ggml.h"
++#include "ggml-backend.h"
++#include "ggml-impl.h"
++
++#include <vector>
++#include <fstream>
++#include <numeric>
++#include <sstream>
++#include <unordered_map>
++
++struct hot_history {
++    std::vector<int32_t> ids;
++    std::vector<uint32_t> counts;
++};
++
++static std::unordered_map<int, hot_history> load_hot_map() {
++    std::unordered_map<int, hot_history> out;
++    const char * path = getenv("TOSH_MOE_HOT_MAP");
++    if (!path) return out;
++    std::ifstream in(path);
++    std::string line;
++    while (std::getline(in, line)) {
++        std::istringstream row(line);
++        int il = -1;
++        if (!(row >> il)) continue;
++        std::string token;
++        bool legacy_ranking = true;
++        while (row >> token) {
++            const size_t colon = token.find(':');
++            legacy_ranking = legacy_ranking && colon == std::string::npos;
++            try {
++                const int e = std::stoi(token.substr(0, colon));
++                const uint32_t count = colon == std::string::npos ? 1u
++                    : (uint32_t) std::max(1, std::stoi(token.substr(colon + 1)));
++                out[il].ids.push_back(e);
++                out[il].counts.push_back(count);
++            } catch (...) {
++                out.erase(il);
++                break;
++            }
++        }
++        const auto found = out.find(il);
++        if (legacy_ranking && found != out.end()) {
++            auto & counts = found->second.counts;
++            for (size_t i = 0; i < counts.size(); ++i) counts[i] = (uint32_t) (counts.size() - i);
++        }
++    }
++    return out;
++}
++
++// Every slot starts empty: the kernels expect -1 for "nowhere" and a zero clock.
++void tosh_moe_seed_banks(void) {
++    const int n = tosh_moe_bind_count();
++
++    std::vector<int32_t> init;
++    const auto hot_map = load_hot_map();
++
++    for (int i = 0; i < n; i++) {
++        const void * sv = nullptr;
++        const void * hv = nullptr;
++        tosh_moe_bind_at(i, &sv, &hv);
++
++        auto * slots = (ggml_tensor *) sv;
++        auto * host  = (ggml_tensor *) hv;
++        auto * state = (ggml_tensor *) tosh_moe_state_of(sv);
++        if (!slots || !host || !state || !state->buffer) {
++            GGML_LOG_WARN("%s: an expert bank has no state, the cache stays off for it\n", __func__);
++            continue;
++        }
++
++        const int n_expert  = tosh_moe_experts_of(slots);
++        const int n_slots   = (int) slots->ne[2];
++        const int n_fixed   = tosh_moe_fixed_of(slots);
++        const int max_fetch = n_fixed > 0 ? n_slots - n_fixed : n_slots;
++        const bool split_bank = host->ne[2] < n_expert;
++
++        std::vector<int32_t> fixed_ids(n_fixed);
++        std::iota(fixed_ids.begin(), fixed_ids.end(), 0);
++        const int il = tosh_moe_layer_of(slots);
++        const auto hit = hot_map.find(il);
++        if (split_bank && hit != hot_map.end() && (int) hit->second.ids.size() >= n_fixed) {
++            std::vector<uint8_t> used(n_expert, 0);
++            bool valid = true;
++            for (int s = 0; s < n_fixed; ++s) {
++                const int e = hit->second.ids[s];
++                if (e < 0 || e >= n_expert || used[e]) { valid = false; break; }
++                used[e] = 1;
++                fixed_ids[s] = e;
++            }
++            if (valid) {
++                const size_t row = host->nb[2];
++                std::vector<uint8_t> old_fixed((size_t) n_fixed*row);
++                std::vector<uint8_t> old_cold((size_t) (n_expert - n_fixed)*row);
++                std::vector<uint8_t> new_fixed(old_fixed.size());
++                std::vector<uint8_t> new_cold(old_cold.size());
++                ggml_backend_tensor_get(slots, old_fixed.data(), 0, old_fixed.size());
++                memcpy(old_cold.data(), host->data, old_cold.size());
++                const auto source = [&](int e) -> const uint8_t * {
++                    return e < n_fixed ? old_fixed.data() + (size_t) e*row
++                                       : old_cold.data() + (size_t) (e - n_fixed)*row;
++                };
++                for (int s = 0; s < n_fixed; ++s) {
++                    memcpy(new_fixed.data() + (size_t) s*row, source(fixed_ids[s]), row);
++                }
++                int cold = 0;
++                for (int e = 0; e < n_expert; ++e) {
++                    if (!used[e]) memcpy(new_cold.data() + (size_t) cold++*row, source(e), row);
++                }
++                ggml_backend_tensor_set(slots, new_fixed.data(), 0, new_fixed.size());
++                memcpy(host->data, new_cold.data(), new_cold.size());
++            }
++        }
++
++        std::vector<int32_t> cold_for(n_expert, -1);
++        std::vector<uint8_t> is_fixed(n_expert, 0);
++        for (int s = 0; s < n_fixed; ++s) is_fixed[fixed_ids[s]] = 1;
++        int cold = 0;
++        for (int e = 0; e < n_expert; ++e) if (!is_fixed[e]) cold_for[e] = cold++;
++        if (split_bank && il >= 0) {
++            if (hit != hot_map.end()) {
++                tosh_moe_seen_seed(il, hit->second.ids.data(), hit->second.counts.data(), (int) hit->second.ids.size());
++            }
++            tosh_moe_hot_set(il, fixed_ids.data(), n_fixed);
++            tosh_moe_cold_set(il, cold_for.data(), n_expert);
++        }
++
++        init.assign(tosh_moe_state_ints(n_expert, n_slots, max_fetch), 0);
++
++        for (int e = 0; e < n_expert; e++) {
++            init[tosh_moe_off_slot_for_id(n_expert, n_slots, max_fetch) + e] = -1;
++            init[tosh_moe_off_cold_for_id(n_expert, n_slots, max_fetch) + e] = split_bank ? cold_for[e] : e;
++        }
++        for (int s = 0; s < n_slots; s++) {
++            init[tosh_moe_off_id_of_slot(n_expert, n_slots, max_fetch) + s] = -1;
++        }
++
++        // A CPU-owned bank is consumed through the scheduler's prefetch path during wide
++        // batches. Do not seed it through Metal's partial tensor-set path: the first decode
++        // token fills all K slots anyway, and avoiding the eager seed also avoids invalid
++        // range lookups on discrete-GPU model buffers.
++        const bool cpu_bank = getenv("TOSH_MOE_CPU_BANK") != nullptr;
++
++        // start with the first experts already in, so a fresh cache is not one big miss
++        if (split_bank) {
++            for (int s = 0; s < n_fixed; s++) {
++                const int e = fixed_ids[s];
++                init[tosh_moe_off_slot_for_id(n_expert, n_slots, max_fetch) + e] = s;
++                init[tosh_moe_off_cold_for_id(n_expert, n_slots, max_fetch) + e] = -1;
++                init[tosh_moe_off_id_of_slot(n_expert, n_slots, max_fetch) + s] = e;
++            }
++        } else if (!cpu_bank && getenv("TOSH_MOE_NO_SEED") == nullptr) {
++            const size_t row = host->nb[2];
++            for (int s = 0; s < n_slots && s < n_expert; s++) {
++                ggml_backend_tensor_set(slots, (const char *) host->data + (size_t) s*row, (size_t) s*row, row);
++                init[tosh_moe_off_slot_for_id(n_expert, n_slots, max_fetch) + s] = s;
++                init[tosh_moe_off_id_of_slot(n_expert, n_slots, max_fetch) + s] = s;
++            }
++        }
++
++        ggml_backend_tensor_set(state, init.data(), 0, init.size()*sizeof(int32_t));
++    }
++}
+diff --git a/tosh-moe/tosh-moe-lru.metal b/tosh-moe/tosh-moe-lru.metal
+new file mode 100644
+index 000000000..3af62d3bf
+--- /dev/null
++++ b/tosh-moe/tosh-moe-lru.metal
+@@ -0,0 +1,238 @@
++#include <metal_stdlib>
++using namespace metal;
++
++// Timestamp LRU over a bank of slots, one threadgroup, no host involvement: the routing
++// arrives as expert ids and leaves as slot ids, or -1 for an expert this step will not
++// fetch. Fixed shapes, so it can sit inside a captured graph.
++struct tosh_lru_args {
++    int32_t n_used;      // experts per token
++    int32_t n_tokens;
++    int32_t stride;      // ints between one token's ids and the next, which is not n_used
++    int32_t n_expert;
++    int32_t n_slots;
++    int32_t n_fixed;
++    int32_t max_fetch;   // cap per step; the rest stay non-resident
++};
++
++kernel void tosh_moe_lru(
++        constant tosh_lru_args & args         [[buffer(0)]],
++        device const int32_t   * ids          [[buffer(1)]],   // the routing, untouched
++        device   int32_t       * ids_out      [[buffer(9)]],   // the same, as slots
++        device const int32_t   * cold_for_id  [[buffer(10)]],
++        device   int32_t       * slot_for_id  [[buffer(2)]],
++        device   int32_t       * id_of_slot   [[buffer(3)]],
++        device   int32_t       * usage        [[buffer(4)]],
++        device   int32_t       * step         [[buffer(5)]],
++        device   int32_t       * evict_slots  [[buffer(6)]],
++        device   int32_t       * src_indices  [[buffer(7)]],
++        device   int32_t       * n_indices    [[buffer(8)]],
++        threadgroup int32_t    * shm          [[threadgroup(0)]],
++        uint tid  [[thread_position_in_threadgroup]],
++        uint ntg  [[threads_per_threadgroup]]) {
++
++    threadgroup int32_t * active  = shm;                    // n_expert
++    threadgroup int32_t * missing = shm + args.n_expert;     // n_expert
++    threadgroup int32_t * red     = missing + args.n_expert; // 2*ntg, for the argmin
++
++    int32_t now = 0;
++    if (tid == 0) {
++        now = *step + 1;
++        *step = now;
++        *n_indices = 0;
++    }
++    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
++    now = *step;
++
++    // which experts this step wants, and which of those are not here
++    for (uint e = tid; e < (uint) args.n_expert; e += ntg) {
++        active[e]  = 0;
++        missing[e] = 0;
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    const uint n_active = (uint) (args.n_used*args.n_tokens);
++    for (uint i = tid; i < n_active; i += ntg) {
++        const uint t = i / (uint) args.n_used;
++        const uint k = i % (uint) args.n_used;
++        const int32_t e = ids[t*(uint) args.stride + k];
++        if (e >= 0 && e < args.n_expert) {
++            active[e] = 1;
++        }
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    for (uint e = tid; e < (uint) args.n_expert; e += ntg) {
++        if (active[e] == 0) {
++            continue;
++        }
++        const int32_t s = slot_for_id[e];
++        if (s >= 0) {
++            usage[s] = now;    // a hit keeps its place
++        } else {
++            missing[e] = 1;
++        }
++    }
++    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
++
++    // Serial over the fetches, which depend on each other, but the search for the least
++    // recently used slot is a threadgroup reduction: on a big bank it is thousands of
++    // comparisons and one thread would walk them alone.
++    threadgroup int32_t * best_u = red;              // ntg
++    threadgroup int32_t * best_s = red + 256;        // ntg
++
++    int32_t fetched = 0;
++    for (int32_t e = 0; e < args.n_expert && fetched < args.max_fetch; e++) {
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (missing[e] == 0) {
++            continue;
++        }
++
++        int32_t mine_u = INT_MAX;
++        int32_t mine_s = -1;
++        for (uint sl = (uint) args.n_fixed + tid; sl < (uint) args.n_slots; sl += ntg) {
++            const int32_t owner = id_of_slot[sl];
++            if (owner >= 0 && owner < args.n_expert && active[owner] != 0) {
++                continue;          // in use this step
++            }
++            const int32_t u = usage[sl];
++            if (mine_s < 0 || u < mine_u) {
++                mine_u = u;
++                mine_s = (int32_t) sl;
++            }
++        }
++        best_u[tid] = mine_u;
++        best_s[tid] = mine_s;
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        for (uint span = ntg/2; span > 0; span >>= 1) {
++            if (tid < span) {
++                const int32_t os = best_s[tid + span];
++                // ties go to the lower slot, so the result does not depend on the split
++                if (os >= 0 && (best_s[tid] < 0 || best_u[tid + span] < best_u[tid] ||
++                        (best_u[tid + span] == best_u[tid] && os < best_s[tid]))) {
++                    best_u[tid] = best_u[tid + span];
++                    best_s[tid] = os;
++                }
++            }
++            threadgroup_barrier(mem_flags::mem_threadgroup);
++        }
++
++        const int32_t victim = best_s[0];
++        if (victim < 0) {
++            break;                 // every slot is needed this step
++        }
++
++        if (tid == 0) {
++            const int32_t old = id_of_slot[victim];
++            if (old >= 0 && old < args.n_expert) {
++                slot_for_id[old] = -1;
++            }
++
++            id_of_slot[victim]   = e;
++            slot_for_id[e]       = victim;
++            usage[victim]        = now;
++            evict_slots[fetched] = victim;
++            src_indices[fetched] = cold_for_id[e];
++        }
++        fetched++;
++    }
++
++    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
++    if (tid == 0) {
++        *n_indices = fetched;
++    }
++    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
++
++    // the routing is left alone; the slots go to their own place, because the ids are also
++    // what the router's weights are gathered with
++    for (uint i = tid; i < n_active; i += ntg) {
++        const uint t = i / (uint) args.n_used;
++        const uint k = i % (uint) args.n_used;
++        const uint o = t*(uint) args.stride + k;
++        const int32_t e = ids[o];
++        ids_out[o] = (e >= 0 && e < args.n_expert) ? slot_for_id[e] : -1;
++    }
++
++}
++
++// Brings the rows the LRU just scheduled from the host bank into their slots. Only the
++// missing ones travel, so the window the device touches stays small no matter how big the
++// bank is.
++struct tosh_fetch_args {
++    uint32_t row_u4;     // row size in uint4 units
++    int32_t  max_fetch;
++    int32_t  n_chunks;   // threadgroups per row: one is far too few for a whole expert
++};
++
++kernel void tosh_moe_fetch(
++        constant tosh_fetch_args & args        [[buffer(0)]],
++        device       uint4       * slots       [[buffer(1)]],
++        device const uint4       * host        [[buffer(2)]],
++        device const int32_t     * evict_slots [[buffer(3)]],
++        device const int32_t     * src_indices [[buffer(4)]],
++        device const int32_t     * n_indices   [[buffer(5)]],
++        uint tgpig [[threadgroup_position_in_grid]],
++        uint tid   [[thread_position_in_threadgroup]],
++        uint ntg   [[threads_per_threadgroup]]) {
++
++    const int32_t i     = (int32_t) (tgpig / (uint) args.n_chunks);
++    const uint    chunk = tgpig % (uint) args.n_chunks;
++    if (i >= *n_indices) {
++        return;
++    }
++
++    const int32_t dst = evict_slots[i];
++    const int32_t src = src_indices[i];
++    if (dst < 0 || src < 0) {
++        return;
++    }
++
++    device       uint4 * d = slots + (uint64_t) dst*args.row_u4;
++    device const uint4 * s = host  + (uint64_t) src*args.row_u4;
++
++    for (uint j = chunk*ntg + tid; j < args.row_u4; j += ntg*(uint) args.n_chunks) {
++        d[j] = s[j];
++    }
++}
++
++// Copies a whole bank from the host into the scratch in one contiguous pass, which is what a
++// batch too wide for the cache needs: reading the experts scattered from host costs far more.
++kernel void tosh_moe_stage(
++        constant uint32_t    & n_u4  [[buffer(0)]],
++        device       uint4   * dst   [[buffer(1)]],
++        device const uint4   * src   [[buffer(2)]],
++        uint tgpig [[threadgroup_position_in_grid]],
++        uint tid   [[thread_position_in_threadgroup]],
++        uint ntg   [[threads_per_threadgroup]],
++        uint ntgs  [[threadgroups_per_grid]]) {
++
++    for (uint i = tgpig*ntg + tid; i < n_u4; i += ntg*ntgs) {
++        dst[i] = src[i];
++    }
++}
++
++// Reconstructs one logical full bank in private scratch without ever wrapping the complete
++// CPU bank as a Metal resource. Hot rows come from private resident slots; cold rows arrive
++// packed in a bounded shared buffer.
++struct tosh_assemble_args {
++    uint32_t row_u4;
++    uint32_t n_expert;
++};
++
++kernel void tosh_moe_assemble(
++        constant tosh_assemble_args & args        [[buffer(0)]],
++        device       uint4          * dst         [[buffer(1)]],
++        device const uint4          * cold        [[buffer(2)]],
++        device const uint4          * slots       [[buffer(3)]],
++        device const int32_t        * slot_for_id [[buffer(4)]],
++        device const int32_t        * cold_for_id [[buffer(5)]],
++        uint gid [[thread_position_in_grid]]) {
++    const uint64_t total = (uint64_t) args.n_expert*args.row_u4;
++    if ((uint64_t) gid >= total) return;
++    const uint32_t expert = gid/args.row_u4;
++    const uint32_t col = gid - expert*args.row_u4;
++    const int32_t slot = slot_for_id[expert];
++    const int32_t ci = cold_for_id[expert];
++    dst[gid] = slot >= 0 ? slots[(uint64_t) slot*args.row_u4 + col]
++                         : cold[(uint64_t) ci*args.row_u4 + col];
++}
+diff --git a/tosh-moe/tosh-moe.h b/tosh-moe/tosh-moe.h
+new file mode 100644
+index 000000000..3e62af81b
+--- /dev/null
++++ b/tosh-moe/tosh-moe.h
+@@ -0,0 +1,152 @@
++// Experimental MoE expert cache: maps an expert to a physical slot, nothing else.
++// RAM keeps every expert, so an eviction only drops a copy. The unit is a whole expert of a
++// layer, all of its tensors together, because a partial one cannot run.
++
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct tosh_moe_cache;
++
++// n_slots is per layer.
++struct tosh_moe_cache * tosh_moe_cache_init(int n_layer, int n_expert, int n_slots);
++struct tosh_moe_cache * tosh_moe_cache_init_fixed(int n_layer, int n_expert, int n_slots, int n_fixed);
++void                    tosh_moe_cache_set_fixed(struct tosh_moe_cache * c, int il, const int32_t * experts, int n);
++void                    tosh_moe_cache_free(struct tosh_moe_cache * c);
++
++// Slot of an expert, or -1. Leaves the state alone so a caller can plan before committing.
++int tosh_moe_cache_find(const struct tosh_moe_cache * c, int il, int expert);
++
++// Pin a resident expert for this step: not evictable, and its recency moves to now.
++int tosh_moe_cache_hold(struct tosh_moe_cache * c, int il, int expert);
++
++// Give an expert a slot, evicting the least recently used one that is not held, and hold it.
++// Returns -1 when every slot of the layer is held; the caller has to run it elsewhere.
++int tosh_moe_cache_admit(struct tosh_moe_cache * c, int il, int expert, int * out_evicted);
++
++// Ends the step: releases every hold and advances the recency clock.
++void tosh_moe_cache_step(struct tosh_moe_cache * c);
++
++// False on the first broken invariant, naming it in `why`.
++bool tosh_moe_cache_check(const struct tosh_moe_cache * c, const char ** why);
++
++struct tosh_moe_cache_stats {
++    uint64_t steps;
++    uint64_t lookups;
++    uint64_t hits;
++    uint64_t admits;
++    uint64_t evictions;
++    uint64_t starved;   // refused because every slot was held
++};
++
++void tosh_moe_cache_stats_get(const struct tosh_moe_cache * c, struct tosh_moe_cache_stats * out);
++
++enum tosh_moe_mode {
++    TOSH_MOE_OFF = 0,
++    TOSH_MOE_CACHE,    // every expert on the device, a miss is filled before it runs
++    TOSH_MOE_HYBRID,   // the device runs what it holds, the host runs the rest
++};
++
++enum tosh_moe_mode tosh_moe_mode(void);
++
++// The backend registers which of its buffer types keeps weights in host memory, so the
++// loader can tell a bank the user placed there from one that landed in VRAM.
++void         tosh_moe_set_host_buft(const void * buft);
++const void * tosh_moe_host_buft(void);
++
++// Layout of the per-layer cache state, packed in one i32 tensor so the kernels can bind it
++// at offsets instead of needing seven buffers of their own.
++// Widest batch whose remapped routing still fits the state. The ids are padded to one entry
++// per expert, so the room needed is tokens times experts, not tokens times experts used.
++#define TOSH_MOE_MAX_TOKENS 512
++
++static inline int tosh_moe_ids_room(int n_expert) {
++    return TOSH_MOE_MAX_TOKENS*n_expert;
++}
++
++static inline int tosh_moe_state_ints(int n_expert, int n_slots, int max_fetch) {
++    return 2*n_expert + 2*n_slots + 2 + 2*max_fetch + tosh_moe_ids_room(n_expert);
++}
++static inline int tosh_moe_off_slot_for_id(int n_expert, int n_slots, int max_fetch) { (void) n_expert; (void) n_slots; (void) max_fetch; return 0; }
++static inline int tosh_moe_off_cold_for_id(int n_expert, int n_slots, int max_fetch) { (void) n_slots; (void) max_fetch; return n_expert; }
++static inline int tosh_moe_off_id_of_slot (int n_expert, int n_slots, int max_fetch) { (void) n_slots; (void) max_fetch; return 2*n_expert; }
++static inline int tosh_moe_off_usage      (int n_expert, int n_slots, int max_fetch) { (void) max_fetch; return 2*n_expert + n_slots; }
++static inline int tosh_moe_off_step       (int n_expert, int n_slots, int max_fetch) { (void) max_fetch; return 2*n_expert + 2*n_slots; }
++static inline int tosh_moe_off_n_indices  (int n_expert, int n_slots, int max_fetch) { (void) max_fetch; return 2*n_expert + 2*n_slots + 1; }
++static inline int tosh_moe_off_evict      (int n_expert, int n_slots, int max_fetch) { (void) max_fetch; return 2*n_expert + 2*n_slots + 2; }
++static inline int tosh_moe_off_src        (int n_expert, int n_slots, int max_fetch) { return 2*n_expert + 2*n_slots + 2 + max_fetch; }
++static inline int tosh_moe_off_ids        (int n_expert, int n_slots, int max_fetch) { return 2*n_expert + 2*n_slots + 2 + 2*max_fetch; }
++
++// Slots per expert bank, 0 when the cache is off.
++int tosh_moe_slots_want(void);
++
++// Ties a bank of VRAM slots to the weights that stay in RAM. Keys are ggml tensors, kept as
++// void so this stays independent of ggml.
++void         tosh_moe_bind(const void * slots, const void * ram);
++void         tosh_moe_bind_experts(const void * slots, int n_expert);
++int          tosh_moe_experts_of(const void * slots);
++void         tosh_moe_bind_fixed(const void * slots, int n_fixed);
++int          tosh_moe_fixed_of(const void * slots);
++const void * tosh_moe_ram_of(const void * slots);
++
++// The other way round, for the paths that are handed the bank itself.
++const void * tosh_moe_slots_of(const void * bank);
++
++// One scratch in VRAM, the size of a single layer's bank, reused by every layer: a wide batch
++// copies the bank there in one contiguous read and computes from the device.
++void         tosh_moe_set_stage(const void * stage);
++const void * tosh_moe_stage(void);
++
++// The bank itself when the tensor is a set of slots, otherwise the tensor unchanged.
++static inline void * tosh_moe_bank_ptr(void * slots) {
++    const void * host = tosh_moe_ram_of(slots);
++#ifdef __cplusplus
++    return host ? const_cast<void *>(host) : slots;
++#else
++    return host ? (void *) host : slots;
++#endif
++}
++void         tosh_moe_unbind_all(void);
++
++void tosh_moe_layer_set(const void * tensor, int il, int n_expert);
++int  tosh_moe_layer_of(const void * tensor);
++void tosh_moe_hot_set(int il, const int32_t * experts, int n);
++const int32_t * tosh_moe_hot_of(int il, int * n);
++void tosh_moe_cold_set(int il, const int32_t * cold_for, int n);
++int  tosh_moe_cold_of(int il, int expert);
++void tosh_moe_observe(const void * tensor, const int32_t * ids, int n);
++void tosh_moe_seen_seed(int il, const int32_t * experts, const uint32_t * counts, int n);
++void tosh_moe_seen_dump(void);
++const uint32_t * tosh_moe_seen_of(int il, int * n);
++void tosh_moe_seen_clear(int il);
++
++void         tosh_moe_bind_state(const void * slots, const void * state);
++
++// The banks of a layer share one routing, so the pick runs once per layer and the fetch once
++// per bank. True on the first bank of the layer this pass reaches: node indices climb within
++// a pass, so one that does not climb means a new pass has started.
++bool tosh_moe_should_route(const void * slots, int node_idx);
++const void * tosh_moe_state_of(const void * slots);
++
++int  tosh_moe_bind_count(void);
++void tosh_moe_bind_at(int i, const void ** slots, const void ** ram);
++
++// Residency of one bank: table[expert] is its slot, or -1 when it is not on the device. The
++// device path computes the experts that have a slot and the host path the rest, so the two
++// together cover every expert exactly once. Keyed by either tensor of the bank.
++// Seeds every bank once the weights are in: the first slots take the first experts and the
++// last slot is left at zero, which is where the table sends an expert the device does not hold.
++void tosh_moe_seed_banks(void);
++
++
++const int32_t * tosh_moe_table_of(const void * tensor, int * n_expert);
++void            tosh_moe_table_set(const void * slots, const int32_t * table, int n_expert);
++
++#ifdef __cplusplus
++}
++#endif

@@ -1,0 +1,25 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 7be8f38d0..4427bae5d 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1433,16 +1433,20 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
+                     // head-64 prefill path below.
+                     char simd_width_env[16];
+                     snprintf(simd_width_env, sizeof(simd_width_env), "%d", dev->props.simd_width);
+                     setenv("TOSH_METAL_SIMD_WIDTH", simd_width_env, 1);
+                 }
+ 
+                 dev->props.has_simdgroup_reduction  = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
+                 dev->props.has_simdgroup_reduction |= [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
++                // macOS 12 has no Metal3 family, but AMD cards already reduce across a simdgroup on Mac2
++                if (strstr(dev->mtl_device.name.UTF8String ?: "", "AMD") != NULL) {
++                    dev->props.has_simdgroup_reduction |= [dev->mtl_device supportsFamily:MTLGPUFamilyMac2];
++                }
+                 // simdgroup reduction kernels produce corrupted output on AMD RDNA 2 (e.g. RX 6700 XT)
+                 if (TOSH_ENV("GGML_METAL_SIMDGROUP_REDUCTION_DISABLE") != NULL) {
+                     dev->props.has_simdgroup_reduction = false;
+                 }
+ 
+                 // wave64 GPUs (AMD GCN/Vega): the 32-wide simdgroup reduction and mat-vec
+                 // kernels corrupt output, so route them to the CPU; only the wave-agnostic
+                 // manual mul_mm below runs on the GPU. Gated off for wave32 (Apple/RDNA).

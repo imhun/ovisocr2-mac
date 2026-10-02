@@ -1,0 +1,30 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 3698257d7..b9881d819 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -421,21 +421,22 @@ llama_context::llama_context(
+             backend_ptrs.push_back(backend.get());
+             backend_buf_exp_size.push_back(0);
+         }
+ 
+         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
+ 
+         // TODO: move these checks to ggml_backend_sched
+         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
++        // No device-count check: the scheduler only creates its events when this is on, and
++        // without them every crossing to the CPU drains the GPU instead of waiting on one. That
++        // costs nothing on unified memory, so upstream only asks for it when there are several
++        // devices to overlap.
+         bool pipeline_parallel =
+-            model.n_devices() > 1 &&
+             model.n_gpu_layers() > model.hparams.n_layer_all &&
+-            // no split-mode check: groups of tensor-parallel devices are handed over layer by
+-            // layer too, so they overlap the same way a plain layer split does
+             cparams.offload_kqv &&
+             !model.has_tensor_overrides();
+ 
+         // pipeline parallelism requires support for async compute and events in all devices
+         if (pipeline_parallel) {
+             for (auto & backend : backends) {
+                 auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
+                 if (dev_type == GGML_BACKEND_DEVICE_TYPE_CPU || dev_type == GGML_BACKEND_DEVICE_TYPE_ACCEL) {

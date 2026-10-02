@@ -1,0 +1,97 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 033038d81..833744c98 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2894,6 +2894,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             }
+         }
+     ).set_env("LLAMA_ARG_FIT"));
++    add_opt(common_arg(
++        { "--dynamic-moe" }, "[on|off]",
++        string_format("plan MoE memory with Dynamic MoE: the planner picks expert residency in VRAM and RAM, "
++                      "or a safe fallback, and refuses to load when nothing fits ('on' or 'off', default: '%s')",
++                      params.dynamic_moe ? "on" : "off"),
++        [](common_params & params, const std::string & value) {
++            if (is_truthy(value)) {
++                params.dynamic_moe = true;
++            } else if (is_falsey(value)) {
++                params.dynamic_moe = false;
++            } else {
++                throw std::runtime_error(
++                    string_format("error: unknown value for --dynamic-moe: '%s'\n", value.c_str()));
++            }
++        }
++    ).set_env("LLAMA_ARG_DYNAMIC_MOE"));
+     add_opt(common_arg(
+         { "-fitp", "--fit-print" }, "[on|off]",
+         string_format("print the estimated required memory ('on' or 'off', default: '%s')", params.fit_params_print ? "on" : "off"),
+diff --git a/common/common.cpp b/common/common.cpp
+index e68565d33..78a4972cb 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1315,7 +1315,9 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+     pimpl(new impl{}) {
+     {
+         tosh_plan plan;
+-        tosh_plan_apply(params, &plan);
++        if (!tosh_plan_apply(params, &plan) && plan.state == TOSH_PLAN_NOT_PLANNED && !params.dynamic_moe && getenv("TOSH_AUTO") == nullptr) {
++            LOG_INF("Tosh MoE: standard\n");
++        }
+         // no plan fits: loading with the defaults would hand memory to a layout nobody checked
+         if (plan.state == TOSH_PLAN_UNSUPPORTED && getenv("TOSH_AUTO_DRY_RUN") == nullptr) {
+             LOG_ERR("%s: TOSH_AUTO found no configuration that fits (%s), the model is not loaded\n", __func__, plan.primary_reason.c_str());
+diff --git a/common/common.h b/common/common.h
+index 95fb37f51..f818db66e 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -474,6 +474,7 @@ struct common_params {
+     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
+     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
+     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
++    bool    dynamic_moe        = false; // Tosh plans MoE memory: expert residency, host RAM and fallback
+     bool    fit_params_print   = false; // print the estimated required memory to run the model
+     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
+ 
+diff --git a/common/tosh-plan.cpp b/common/tosh-plan.cpp
+index c3abcfea6..8f0730faa 100644
+--- a/common/tosh-plan.cpp
++++ b/common/tosh-plan.cpp
+@@ -186,9 +186,12 @@ moe_info read_moe_info(const char * path) {
+     return mi;
+ }
+ 
++// the product switch plans host memory from the machine's state unless told otherwise
++static bool g_runtime_default = false;
++
+ bool host_policy_runtime() {
+     const char * v = getenv("TOSH_AUTO_HOST_POLICY");
+-    return v != nullptr && strcmp(v, "runtime") == 0;
++    return v == nullptr ? g_runtime_default : strcmp(v, "runtime") == 0;
+ }
+ 
+ host_mem read_host_info() {
+@@ -474,11 +477,11 @@ static void plan_log(const tosh_plan & p) {
+     std::string warn;
+     for (const auto & w : p.warnings) warn += (warn.empty() ? "" : ",") + w;
+     if (p.plan_mode == TOSH_PLAN_MODE_UNSUPPORTED) {
+-        LOG_INF("Tosh Auto: mode=%s reason=%s limits=%s required_host=%.1fGiB available_host=%.1fGiB required_vram=%.1fGiB available_vram=%.1fGiB\n",
++        LOG_INF("Tosh Dynamic MoE: mode=%s reason=%s limits=%s required_host=%.1fGiB available_host=%.1fGiB required_vram=%.1fGiB available_vram=%.1fGiB\n",
+                 p.code.c_str(), p.primary_reason.c_str(), limits.c_str(), p.required_host_mib/1024, p.available_host_mib/1024,
+                 p.required_vram_mib/1024, p.available_vram_mib/1024);
+     } else {
+-        LOG_INF("Tosh Auto: mode=%s reason=%s%s%s rss=%.1fGiB vram=%.1fGiB warm=%.1fGiB hot=%.1fGiB coverage=%.2f %s ctx=%d kv=%s ub=%d%s\n",
++        LOG_INF("Tosh Dynamic MoE: mode=%s reason=%s%s%s rss=%.1fGiB vram=%.1fGiB warm=%.1fGiB hot=%.1fGiB coverage=%.2f %s ctx=%d kv=%s ub=%d%s\n",
+                 p.code.c_str(), p.primary_reason.c_str(), warn.empty() ? "" : " warnings=", warn.c_str(), p.projected_rss_mib/1024,
+                 p.private_mib/1024, p.warm_mib/1024, p.arena_mib/1024, p.coverage, p.coverage_state.c_str(), p.n_ctx, kv_name(p.kv), p.ubatch,
+                 p.ncmoe > 0 ? string_format(" ncmoe=%d", p.ncmoe).c_str() : "");
+@@ -525,7 +528,10 @@ static void plan_emit(const tosh_plan & p) {
+ }
+ 
+ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
++    // precedence: TOSH_DMOE_* set by hand, then TOSH_AUTO, then --dynamic-moe, then the standard path
+     const char * mode_env = getenv("TOSH_AUTO");
++    g_runtime_default = params.dynamic_moe;
++    if (mode_env == nullptr && params.dynamic_moe) mode_env = "1";
+     if (mode_env == nullptr || strcmp(mode_env, "0") == 0 || strcmp(mode_env, "off") == 0) {
+         return false;
+     }

@@ -1,0 +1,365 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.h b/ggml/src/ggml-metal/ggml-metal-context.h
+index 8ab795f0d..fef606412 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.h
++++ b/ggml/src/ggml-metal/ggml-metal-context.h
+@@ -36,19 +36,21 @@ bool ggml_metal_cpy_tensor_async_ex(ggml_metal_t ctx_src, ggml_metal_t ctx_dst,
+ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
+ 
+ // acc += add, both f32 and contiguous. Encodes the kernel directly so a tensor-split
+ // allreduce does not pay a full graph submission per step.
+ bool ggml_metal_add_inplace_supported(ggml_metal_t ctx, const struct ggml_tensor * acc, const struct ggml_tensor * add);
+ bool ggml_metal_add_inplace_async    (ggml_metal_t ctx, struct ggml_tensor * acc, const struct ggml_tensor * add);
+ 
+ // One command buffer per card per butterfly step: both copies and the add together.
++// t_peer lets a peer-connected pair read the partner's partial straight out of its VRAM;
++// pass NULL and the exchange always stages through the shared host block.
+ bool ggml_metal_exchange_reduce(ggml_metal_t ctx_self, ggml_metal_t ctx_peer,
+-                                struct ggml_tensor * t_self, struct ggml_tensor * tmp_self,
+-                                uint64_t seq);
++                                struct ggml_tensor * t_self, struct ggml_tensor * t_peer,
++                                struct ggml_tensor * tmp_self, uint64_t seq);
+ 
+ enum ggml_status ggml_metal_graph_compute (ggml_metal_t ctx, struct ggml_cgraph * gf);
+ void             ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf);
+ 
+ void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev);
+ void ggml_metal_event_wait  (ggml_metal_t ctx, ggml_metal_event_t ev);
+ 
+ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx);
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index 38dff9f84..182caa063 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -271,21 +271,26 @@ struct ggml_metal {
+     // Synchronization and resources shared by both cross-device copy paths.
+     struct ggml_metal_xdev_link {
+         ggml_metal_device_t  src_dev;
+         void *               host;
+         size_t               cap;
+         id<MTLBuffer>        wrap_src, wrap_dst;
+         // Retaining the source keeps its cached remote view valid.
+         id<MTLBuffer>        peer_src, peer_view;
++        // The collective caches its own view: it orders on seq_x, and an invalidation that
++        // waited on the copy path's seq would let go of a view a queued exchange still reads.
++        id<MTLBuffer>        peer_x_src, peer_x_view;
++        int                  peer_x_ok; // -1 unknown, 0 ineligible, 1 eligible
+         id<MTLSharedEvent>   ev_ready, ev_done;
+         id<MTLSharedEvent>   ev_x_ready, ev_x_done;
+         uint64_t             seq;
+         uint64_t             seq_x;
+         bool                 peer_logged;
++        bool                 peer_x_logged;
+     } xlinks[4];
+     int n_xlinks;
+ 
+     dispatch_queue_t d_queue;
+ 
+     // additional, inference-time compiled pipelines
+     ggml_metal_pipelines_t pipelines_ext;
+ 
+@@ -597,16 +602,18 @@ void ggml_metal_free(ggml_metal_t ctx) {
+         }
+         if (ctx->xlinks[i].seq_x > 0) {
+             [ctx->xlinks[i].ev_x_done waitUntilSignaledValue:ctx->xlinks[i].seq_x timeoutMS:10000];
+         }
+         [ctx->xlinks[i].wrap_src release];
+         [ctx->xlinks[i].wrap_dst release];
+         [ctx->xlinks[i].peer_view release];
+         [ctx->xlinks[i].peer_src release];
++        [ctx->xlinks[i].peer_x_view release];
++        [ctx->xlinks[i].peer_x_src release];
+         [ctx->xlinks[i].ev_ready release];
+         [ctx->xlinks[i].ev_done release];
+         [ctx->xlinks[i].ev_x_ready release];
+         [ctx->xlinks[i].ev_x_done release];
+         free(ctx->xlinks[i].host);
+     }
+ 
+     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
+@@ -1010,17 +1017,18 @@ static struct ggml_metal_xdev_link * ggml_metal_xdev_link_get(
+             break;
+         }
+     }
+     if (link == NULL) {
+         if (ctx_dst->n_xlinks == 4) {
+             return NULL;
+         }
+         link = &ctx_dst->xlinks[ctx_dst->n_xlinks++];
+-        link->src_dev = ctx_src->dev;
++        link->src_dev  = ctx_src->dev;
++        link->peer_x_ok = -1;
+         id<MTLDevice> dev_src = ggml_metal_device_get_obj(ctx_src->dev);
+         id<MTLDevice> dev_dst = ggml_metal_device_get_obj(ctx_dst->dev);
+         link->ev_ready = [dev_src newSharedEvent];
+         link->ev_done  = [dev_dst newSharedEvent];
+         link->ev_x_ready = [dev_src newSharedEvent];
+         link->ev_x_done  = [dev_dst newSharedEvent];
+         if (link->ev_ready == nil || link->ev_done == nil ||
+             link->ev_x_ready == nil || link->ev_x_done == nil) {
+@@ -1600,27 +1608,208 @@ static bool ggml_metal_add_inplace_into(ggml_metal_t ctx, id<MTLCommandBuffer> c
+ 
+     return true;
+ }
+ 
+ bool ggml_metal_add_inplace_async(ggml_metal_t ctx, struct ggml_tensor * acc, const struct ggml_tensor * add) {
+     return ggml_metal_add_inplace_into(ctx, nil, acc, add);
+ }
+ 
++// Two cards of one Metal peer group can read each other's VRAM, so the collective has no
++// reason to bounce its partials through a host block. Decided once per link.
++static bool ggml_metal_tp2_peer_eligible(ggml_metal_t ctx_self, ggml_metal_t ctx_peer,
++                                         struct ggml_metal_xdev_link * link) {
++#if TARGET_OS_OSX
++    if (link->peer_x_ok >= 0) {
++        return link->peer_x_ok == 1;
++    }
++
++    static int use_peer = -1;
++    if (use_peer < 0) {
++        const char * v = getenv("TOSH_MGPU_PEER");
++        use_peer = (v && v[0] == '1') ? 1 : 0;
++    }
++
++    link->peer_x_ok = 0;
++
++    if (use_peer && @available(macOS 10.15, *)) {
++        id<MTLDevice> dev_self = ggml_metal_device_get_obj(ctx_self->dev);
++        id<MTLDevice> dev_peer = ggml_metal_device_get_obj(ctx_peer->dev);
++        const bool same_dev = dev_self == dev_peer && ggml_metal_peer_self();
++        const uint64_t group = dev_peer.peerGroupID;
++
++        if (same_dev || (group != 0 && group == dev_self.peerGroupID)) {
++            link->peer_x_ok = 1;
++        }
++
++        if (!link->peer_x_logged) {
++            link->peer_x_logged = true;
++            fprintf(stderr, link->peer_x_ok
++                        ? "ggml_metal: TP2 peer-direct allreduce enabled for %s <-> %s (peer group %llu)\n"
++                        : "ggml_metal: TP2 peer-direct unavailable, using staged allreduce (%s <-> %s, peer group %llu)\n",
++                    dev_self.name.UTF8String, dev_peer.name.UTF8String, (unsigned long long) group);
++        }
++    }
++
++    return link->peer_x_ok == 1;
++#else
++    GGML_UNUSED(ctx_self);
++    GGML_UNUSED(ctx_peer);
++    link->peer_x_ok = 0;
++    return false;
++#endif
++}
++
++// A view of the peer's buffer, valid on this card. Rebuilt only when the peer hands over a
++// different MTLBuffer, and never while an exchange that reads the old one is still queued.
++static id<MTLBuffer> ggml_metal_tp2_peer_view(struct ggml_metal_xdev_link * link,
++                                              id<MTLBuffer> metal_peer, id<MTLDevice> dev_self,
++                                              bool same_dev) {
++#if TARGET_OS_OSX
++    if (link->peer_x_src == metal_peer && link->peer_x_view != nil) {
++        if (tosh_mgpu_trace()) {
++            atomic_fetch_add(&g_tr_rv_hit, 1);
++        }
++        return link->peer_x_view;
++    }
++
++    if (link->peer_x_view != nil && link->seq_x > 0 &&
++        ![link->ev_x_done waitUntilSignaledValue:link->seq_x timeoutMS:10000]) {
++        return nil;
++    }
++
++    [link->peer_x_view release];
++    [link->peer_x_src  release];
++    link->peer_x_view = same_dev ? [metal_peer retain]
++                                 : [metal_peer newRemoteBufferViewForDevice:dev_self];
++    link->peer_x_src  = link->peer_x_view != nil ? [metal_peer retain] : nil;
++
++    if (link->peer_x_view != nil && tosh_mgpu_trace()) {
++        atomic_fetch_add(&g_tr_rv_new, 1);
++    }
++
++    return link->peer_x_view;
++#else
++    GGML_UNUSED(link); GGML_UNUSED(metal_peer); GGML_UNUSED(dev_self); GGML_UNUSED(same_dev);
++    return nil;
++#endif
++}
++
++// The peer-direct half of the exchange. Nothing is encoded until every check has passed, so a
++// refusal here costs the caller only the staged path it would have taken anyway.
++//
++//   signal ready(out)          my partial is final, the peer may read it
++//   wait   ready(in)           the peer's partial is final
++//   blit   remote(t_peer) -> tmp        one crossing, GPU to GPU
++//   signal done(in)            I have read the peer
++//   wait   done(out)           the peer has read me, so the add may overwrite my partial
++//   add    t_self += tmp
++//
++// That last wait is the whole write-after-read hazard: without it the add rewrites the very
++// bytes the other card is still pulling across the fabric.
++static bool ggml_metal_exchange_reduce_peer(ggml_metal_t ctx_self, ggml_metal_t ctx_peer,
++                                            struct ggml_metal_xdev_link * link_out,
++                                            struct ggml_metal_xdev_link * link_in,
++                                            struct ggml_tensor * t_self,
++                                            struct ggml_tensor * t_peer,
++                                            struct ggml_tensor * tmp_self,
++                                            uint64_t seq) {
++#if TARGET_OS_OSX
++    if (t_peer == NULL) {
++        return false;
++    }
++    if (!ggml_metal_tp2_peer_eligible(ctx_self, ctx_peer, link_out)) {
++        return false;
++    }
++
++    struct ggml_metal_buffer_id bid_self = ggml_metal_get_buffer_id(t_self);
++    struct ggml_metal_buffer_id bid_peer = ggml_metal_get_buffer_id(t_peer);
++    struct ggml_metal_buffer_id bid_tmp  = ggml_metal_get_buffer_id(tmp_self);
++    if (bid_self.metal == nil || bid_peer.metal == nil || bid_tmp.metal == nil) {
++        return false;
++    }
++
++    const size_t size = ggml_nbytes(t_self);
++    if (ggml_nbytes(t_peer) != size) {
++        return false;
++    }
++
++    id<MTLBuffer> metal_peer = (id<MTLBuffer>) bid_peer.metal;
++    id<MTLBuffer> metal_tmp  = (id<MTLBuffer>) bid_tmp.metal;
++    if (bid_peer.offs > metal_peer.length || size > metal_peer.length - bid_peer.offs ||
++        bid_tmp.offs  > metal_tmp.length  || size > metal_tmp.length  - bid_tmp.offs) {
++        return false;
++    }
++
++    if (!ggml_metal_add_inplace_supported(ctx_self, t_self, tmp_self)) {
++        return false;
++    }
++
++    id<MTLDevice> dev_self = ggml_metal_device_get_obj(ctx_self->dev);
++    id<MTLDevice> dev_peer = ggml_metal_device_get_obj(ctx_peer->dev);
++    const bool same_dev = dev_self == dev_peer && ggml_metal_peer_self();
++
++    // the view lives on the link the peer's data travels in on, which is the one the wait
++    // below names, so the two cannot get out of step
++    id<MTLBuffer> view = ggml_metal_tp2_peer_view(link_in, metal_peer, dev_self, same_dev);
++    if (view == nil) {
++        return false;
++    }
++
++    link_out->seq_x = seq;
++
++    @autoreleasepool {
++        id<MTLCommandBuffer> cmd_buf = ggml_metal_cmd_buf_continue(ctx_self);
++
++        [cmd_buf encodeSignalEvent:link_out->ev_x_ready value:seq];
++        [cmd_buf encodeWaitForEvent:link_in->ev_x_ready value:seq];
++
++        id<MTLBlitCommandEncoder> enc = [cmd_buf blitCommandEncoder];
++        [enc copyFromBuffer:view sourceOffset:bid_peer.offs
++                   toBuffer:metal_tmp destinationOffset:bid_tmp.offs size:size];
++        [enc endEncoding];
++
++        [cmd_buf encodeSignalEvent:link_in->ev_x_done value:seq];
++        [cmd_buf encodeWaitForEvent:link_out->ev_x_done value:seq];
++
++        ggml_metal_add_inplace_into(ctx_self, cmd_buf, t_self, tmp_self);
++
++        tosh_trace_cmd_buf(cmd_buf);
++        ggml_metal_cmd_buf_end(ctx_self, cmd_buf, false);
++    }
++
++    if (tosh_mgpu_trace()) {
++        atomic_fetch_add(&g_tr_reduce, 1);
++        atomic_fetch_add(&g_tr_bytes_peer, size);
++    }
++
++    return true;
++#else
++    GGML_UNUSED(ctx_self); GGML_UNUSED(ctx_peer); GGML_UNUSED(link_out); GGML_UNUSED(link_in);
++    GGML_UNUSED(t_self); GGML_UNUSED(t_peer); GGML_UNUSED(tmp_self); GGML_UNUSED(seq);
++    return false;
++#endif
++}
++
+ // A buffer per copy is most of what a token creates, and creating one contends on Metal's
+ // shared pools. Every card signals before it waits, so no pair can lock up.
+ bool ggml_metal_exchange_reduce(ggml_metal_t ctx_self, ggml_metal_t ctx_peer,
+-                                struct ggml_tensor * t_self, struct ggml_tensor * tmp_self,
+-                                uint64_t seq) {
++                                struct ggml_tensor * t_self, struct ggml_tensor * t_peer,
++                                struct ggml_tensor * tmp_self, uint64_t seq) {
+     struct ggml_metal_xdev_link * link_out = ggml_metal_xdev_link_get(ctx_self, ctx_peer);
+     struct ggml_metal_xdev_link * link_in  = ggml_metal_xdev_link_get(ctx_peer, ctx_self);
+     if (link_out == NULL || link_in == NULL) {
+         return false;
+     }
+ 
++    if (ggml_metal_exchange_reduce_peer(ctx_self, ctx_peer, link_out, link_in,
++                                        t_self, t_peer, tmp_self, seq)) {
++        return true;
++    }
++
+     struct ggml_metal_buffer_id bid_self = ggml_metal_get_buffer_id(t_self);
+     struct ggml_metal_buffer_id bid_tmp  = ggml_metal_get_buffer_id(tmp_self);
+     if (bid_self.metal == nil || bid_tmp.metal == nil) {
+         return false;
+     }
+ 
+     const size_t size = ggml_nbytes(t_self);
+     if (!ggml_metal_xdev_link_reserve(ctx_self, ctx_peer, link_out, size) ||
+diff --git a/ggml/src/ggml-metal/ggml-metal.cpp b/ggml/src/ggml-metal/ggml-metal.cpp
+index dd7c11237..b4f32af98 100644
+--- a/ggml/src/ggml-metal/ggml-metal.cpp
++++ b/ggml/src/ggml-metal/ggml-metal.cpp
+@@ -553,21 +553,22 @@ static void ggml_backend_metal_read_batch_begin(ggml_backend_t backend) {
+ }
+ 
+ static void ggml_backend_metal_read_batch_end(ggml_backend_t backend) {
+     ggml_metal_read_batch_end((ggml_metal_t) backend->context);
+ }
+ #endif
+ 
+ static bool ggml_backend_metal_exchange_reduce(ggml_backend_t backend_self, ggml_backend_t backend_peer,
+-                                               ggml_tensor * t_self, ggml_tensor * tmp_self, uint64_t seq) {
++                                               ggml_tensor * t_self, ggml_tensor * t_peer,
++                                               ggml_tensor * tmp_self, uint64_t seq) {
+     ggml_metal_t ctx_self = (ggml_metal_t) backend_self->context;
+     ggml_metal_t ctx_peer = (ggml_metal_t) backend_peer->context;
+ 
+-    return ggml_metal_exchange_reduce(ctx_self, ctx_peer, t_self, tmp_self, seq);
++    return ggml_metal_exchange_reduce(ctx_self, ctx_peer, t_self, t_peer, tmp_self, seq);
+ }
+ 
+ static bool ggml_backend_metal_cpy_tensor_async_ex(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst, bool prefer_events, bool hold_dst) {
+     if (!ggml_backend_is_metal(backend_src) || !ggml_backend_is_metal(backend_dst)) {
+         return false;
+     }
+ 
+     if (!ggml_backend_buffer_is_metal(src->buffer) || !ggml_backend_buffer_is_metal(dst->buffer)) {
+@@ -1209,19 +1210,25 @@ static bool ggml_backend_metal_comm_allreduce_tensor(void * comm_ctx_v, ggml_ten
+     for (size_t offset = offset_max; offset >= 1; offset /= 2) {
+         if (fused && prefer_events) {
+             static uint64_t seq_round = 0;
+             seq_round++;
+             bool ok = true;
+             for (size_t j = 0; j < 2*offset_max; j++) {
+                 view_tmp(j, step);
+             }
++            // A pair reads each other's VRAM directly; with more cards a step's partner
++            // changes between rounds, and the view cache would thrash. Passing the partner
++            // only for a pair keeps the fast path to the case it was measured on, and is
++            // where a two-card TensorMesh row would hook in later.
++            const bool pair = 2*offset_max == 2;
+             for (size_t j = 0; j < 2*offset_max && ok; j++) {
+                 ok = ggml_backend_metal_exchange_reduce(comm_ctx->backends[j], comm_ctx->backends[j ^ offset],
+-                                                        tensors[j], &tmp[j], seq_round);
++                                                        tensors[j], pair ? tensors[j ^ offset] : nullptr,
++                                                        &tmp[j], seq_round);
+             }
+             if (ok) {
+                 reduced = true;
+                 step++;
+                 continue;
+             }
+             if (!ok) {
+                 return false;

@@ -1,0 +1,748 @@
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index da733d9e8..1fb695fc4 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -2835,16 +2835,34 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+                     auto & bcj = backend_ctx->backend_configs[j];
+                     ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
+                     nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
+                 }
+                 backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
+             }
+ 
+             if (!backend_allreduce_success) {
++                // the metal comm path declined this collective; the fallback costs ~10 command
++                // buffers per visit, so a persistent decline is the first thing to chase when
++                // decode underperforms. TOSH_MGPU_TRACE=1 prints it once per point.
++                static int tosh_trace_fb = -1;
++                if (tosh_trace_fb < 0) { tosh_trace_fb = getenv("TOSH_MGPU_TRACE") ? 1 : 0; }
++                static thread_local std::vector<ggml_tensor *> seen;
++                bool first_seen = false;
++                if (tosh_trace_fb) {
++                    ggml_tensor * t0 = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->nodes[
++                        backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->n_nodes - 1];
++                    first_seen = true;
++                    for (auto * s : seen) { if (s == t0) { first_seen = false; break; } }
++                    if (first_seen) {
++                        seen.push_back(t0);
++                        fprintf(stderr, "ggml_metal: allreduce subgraph %zu fell back to the generic butterfly\n", i);
++                    }
++                }
++                (void) first_seen;
+                 const ggml_status status = allreduce_fallback(i);
+                 if (status != GGML_STATUS_SUCCESS) {
+                     return status;
+                 }
+             }
+         }
+     }
+     return GGML_STATUS_SUCCESS;
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.h b/ggml/src/ggml-metal/ggml-metal-context.h
+index fef606412..119e8b65b 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.h
++++ b/ggml/src/ggml-metal/ggml-metal-context.h
+@@ -42,16 +42,33 @@ bool ggml_metal_add_inplace_async    (ggml_metal_t ctx, struct ggml_tensor * acc
+ 
+ // One command buffer per card per butterfly step: both copies and the add together.
+ // t_peer lets a peer-connected pair read the partner's partial straight out of its VRAM;
+ // pass NULL and the exchange always stages through the shared host block.
+ bool ggml_metal_exchange_reduce(ggml_metal_t ctx_self, ggml_metal_t ctx_peer,
+                                 struct ggml_tensor * t_self, struct ggml_tensor * t_peer,
+                                 struct ggml_tensor * tmp_self, uint64_t seq);
+ 
++// Create and reserve both directed links of a pair, so exchange_reduce calls running on
++// different host threads cannot race to create the same lazy link or resize its block while
++// a partner is encoding against it. Must run serially before a parallel encode round.
++bool ggml_metal_xdev_prepare(ggml_metal_t ctx_self, ggml_metal_t ctx_peer, size_t size);
++
++// One-shot all-reduce for decode batches: every card pushes its partial into every partner's
++// inbox in a single round and reduces from local VRAM, replacing the staged butterfly. The
++// seq must come from the same counter the exchanges use: links may skip values but never go
++// backwards. Returns false, having encoded nothing, when the group cannot run it.
++bool ggml_metal_allreduce_oneshot(ggml_metal_t * ctxs, struct ggml_tensor ** tensors,
++                                  size_t n, uint64_t seq, uint32_t zero_mask);
++
++// Zero a tensor with a blit fill on its own device. The allreduce uses it for the slices no
++// device computed, so the metal path can contribute zeros instead of falling back to the
++// generic butterfly. Queued ahead of whatever the collective encodes next on this device.
++bool ggml_metal_zero_tensor(ggml_metal_t ctx, struct ggml_tensor * t);
++
+ enum ggml_status ggml_metal_graph_compute (ggml_metal_t ctx, struct ggml_cgraph * gf);
+ void             ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf);
+ 
+ void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev);
+ void ggml_metal_event_wait  (ggml_metal_t ctx, ggml_metal_event_t ev);
+ 
+ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx);
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index 3622fe6cb..cd9dfa040 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -290,16 +290,21 @@ struct ggml_metal {
+         id<MTLBuffer>        shadow[2];
+         id<MTLBuffer>        peer_x_view2[2];
+         size_t               shadow_cap;
+         int                  peer_x_ok; // -1 unknown, 0 ineligible, 1 eligible
+         id<MTLSharedEvent>   ev_ready, ev_done;
+         id<MTLSharedEvent>   ev_x_ready, ev_x_done;
+         uint64_t             seq;
+         uint64_t             seq_x;
++        // per-slot back-pressure for the one-shot: the last seq whose publish landed in the
++        // wrap block at that slot offset. Two slots let a card publish while a lagging
++        // partner is still reading the other slot, the same one-round slack the butterfly
++        // gets by touching each link only every other round.
++        uint64_t             x_slot[2];
+         bool                 peer_logged;
+         bool                 peer_x_logged;
+     } xlinks[4];
+     int n_xlinks;
+ 
+     dispatch_queue_t d_queue;
+ 
+     // additional, inference-time compiled pipelines
+@@ -385,16 +390,17 @@ static _Atomic uint64_t g_tr_merge_waits = 0; // waits that had queued in betwee
+                                               // been dropped before this was fixed
+ static _Atomic uint64_t g_tr_signals     = 0; // cross-device event signals encoded
+ static _Atomic uint64_t g_tr_waits       = 0; // cross-device event waits encoded
+ 
+ 
+ // TOSH_MGPU_TRACE: where the collective's time and bytes go. The counters are only touched
+ // when it is on, so a release run pays one cached branch per crossing.
+ static _Atomic uint64_t g_tr_reduce      = 0; // exchange_reduce calls
++static _Atomic uint64_t g_tr_oneshot     = 0; // one-shot all-reduce collectives
+ static _Atomic uint64_t g_tr_copy        = 0; // plain cross-device copies
+ static _Atomic uint64_t g_tr_bytes_peer  = 0; // crossed through a remote buffer view
+ static _Atomic uint64_t g_tr_bytes_host  = 0; // crossed through the shared host block
+ static _Atomic uint64_t g_tr_cmd_bufs    = 0; // command buffers the collective created
+ static _Atomic uint64_t g_tr_rv_new      = 0; // remote views built
+ static _Atomic uint64_t g_tr_rv_hit      = 0; // remote views reused
+ static _Atomic uint64_t g_tr_encode_ns   = 0; // CPU time inside the collective
+ static _Atomic uint64_t g_tr_gpu_ns      = 0; // GPU execution of the collective's buffers
+@@ -826,16 +832,17 @@ static void tosh_mgpu_trace_report(void) {
+             for (int k = 0; k < 3; k++) {
+                 fprintf(stderr, "    %s us ", rn[k]);
+                 for (int i = 0; i < 8; i++) { fprintf(stderr, "%s %.1f%%  ", lbl[i], 100.0*atomic_load(&hh[k][i])/nn); }
+                 fprintf(stderr, "\n");
+             }
+         }
+     }
+     fprintf(stderr, "  fused boundaries      %llu\n", (unsigned long long) atomic_load(&g_tr_fused_bnd));
++    fprintf(stderr, "  oneshot collectives   %llu\n", (unsigned long long) atomic_load(&g_tr_oneshot));
+     fprintf(stderr, "  remote views new/hit  %llu/%llu\n",
+             (unsigned long long) atomic_load(&g_tr_rv_new),
+             (unsigned long long) atomic_load(&g_tr_rv_hit));
+     fprintf(stderr, "  encode CPU            %.1f ms\n", atomic_load(&g_tr_encode_ns)/1e6);
+     fprintf(stderr, "  collective GPU        %.1f ms\n", atomic_load(&g_tr_gpu_ns)/1e6);
+     fprintf(stderr, "  commit to GPU start   %.1f ms\n", atomic_load(&g_tr_sched_ns)/1e6);
+     // decode-only, per card per token
+     if (atomic_load(&g_snap_taken)) {
+@@ -2726,18 +2733,348 @@ static bool ggml_metal_exchange_reduce_peer(ggml_metal_t ctx_self, ggml_metal_t
+     return true;
+ #else
+     GGML_UNUSED(ctx_self); GGML_UNUSED(ctx_peer); GGML_UNUSED(link_out); GGML_UNUSED(link_in);
+     GGML_UNUSED(t_self); GGML_UNUSED(t_peer); GGML_UNUSED(tmp_self); GGML_UNUSED(seq);
+     return false;
+ #endif
+ }
+ 
++// TOSH_MGPU_ONESHOT=1 engages the one-shot round for decode batches. Default off: at n=4 the
++// measurements say the staged butterfly wins, 38.0 vs 35.8 t/s. The one-shot's publish is one
++// round instead of two, but every card then waits on every partner in the same held command
++// buffer, so each queue stalls on the slowest of the four every collective: NOWAIT decode is
++// 45.7 against 35.8 with the waits in. The butterfly's pairwise rounds stall far less.
++static bool ggml_metal_oneshot_enabled(void) {
++    static int v = -1;
++    if (v < 0) {
++        const char * s = getenv("TOSH_MGPU_ONESHOT");
++        v = (s && s[0] == '1') ? 1 : 0;
++    }
++    return v == 1;
++}
++
++// The one-shot all-reduce: a single round for the whole group instead of the butterfly.
++// Every card publishes its partial once into the host block it shares with each partner,
++// then pulls every partner's partial once and sums locally:
++//
++//   wait   done(out,j)@prev    partner j finished reading this block last round
++//   blit   t_self -> wrap_src(j)        local PCIe write, one per partner
++//   signal ready(out,j)        the partial is published
++//   wait   ready(in,j)         partner j's partial is published
++//   add    t_self += wrap_dst(j)         host read in the add
++//   signal done(in,j)          it has been read
++//
++// Why the host block when the cards can read each other's VRAM: compute-initiated accesses
++// through remote buffer views measure ~600 us for 16 KiB on this stack, one-way either
++// direction, so a peer-direct collective is all latency with none of the bandwidth. The host
++// block is the medium the staged path already proves fast at decode sizes, and the fused
++// boundary from 0065 reads it inside the add. The win over the butterfly is one round instead
++// of log2(n), each card touching the block once out and once in for the whole reduction.
++// Nothing is encoded until every link is reserved and every pipeline resolved, so a refusal
++// leaves the caller's butterfly exactly as it was. seq comes from the counter the staged
++// exchanges use: links may skip values but never go backwards.
++// A tensor no device computed (an empty split slice carries the node but no COMPUTE flag, so
++// its memory is stale from the scratch pool). The generic butterfly zeroes those before the
++// add; the metal collectives need the same and get it with a blit fill on the owning device.
++// Queued on the device's own buffer chain, so it lands before anything the collective
++// publishes from this device.
++bool ggml_metal_zero_tensor(ggml_metal_t ctx, struct ggml_tensor * t) {
++    struct ggml_metal_buffer_id bid = ggml_metal_get_buffer_id(t);
++    if (bid.metal == nil) {
++        return false;
++    }
++    @autoreleasepool {
++        id<MTLCommandBuffer> cmd_buf = ggml_metal_cmd_buf_continue(ctx);
++        id<MTLBlitCommandEncoder> enc = [cmd_buf blitCommandEncoder];
++        [enc fillBuffer:bid.metal range:NSMakeRange(bid.offs, ggml_nbytes(t)) value:0];
++        [enc endEncoding];
++        ggml_metal_cmd_buf_end(ctx, cmd_buf, ggml_metal_collective_hold_batch(tosh_batch_of(t)));
++    }
++    return true;
++}
++
++bool ggml_metal_allreduce_oneshot(ggml_metal_t * ctxs, struct ggml_tensor ** tensors,
++                                  size_t n, uint64_t seq, uint32_t zero_mask) {
++#if TARGET_OS_OSX
++    // xlinks[4] leaves room for three partners per card; beyond that the butterfly's
++    // folding takes over and this schedule does not fit the link tables. At n=2 it is a
++    // strict loss: the butterfly is already one round and every extra event op costs
++    // (49 t/s one-shot vs 61.6 staged), so the two-card case stays on the staged path.
++    if (n < 3 || n > 4 || !ggml_metal_oneshot_enabled()) {
++        if (tosh_mgpu_trace()) fprintf(stderr, "oneshot: bail n=%zu enabled=%d\n", n, ggml_metal_oneshot_enabled());
++        return false;
++    }
++
++    const size_t size = ggml_nbytes(tensors[0]);
++    const size_t slot = (seq & 1) * size;   // two slots side by side, alternating by round
++    const int    sp   = (int) (seq & 1);
++
++    struct ggml_metal_xdev_link * out_l[4][4]; // out_l[i][j]: card i's publish channel to card j
++    struct ggml_metal_xdev_link * in_l[4][4];  // in_l[i][j]:  card j's publish channel to card i
++    uint64_t prev[4][4];                       // last seq that wrote this slot on that link, read before any card re-stamps it
++
++    // resolved in the pre-pass so the encode phase cannot fail halfway through the group
++    struct ggml_metal_pipeline_with_params pipelines[4];
++    ggml_metal_kargs_bin args[4];
++
++    for (size_t i = 0; i < n; i++) {
++        ggml_metal_t ctx_i = ctxs[i];
++
++        if (ggml_metal_get_buffer_id(tensors[i]).metal == nil ||
++            ggml_nbytes(tensors[i]) != size ||
++            ggml_metal_library_get_pipeline_bin_one(ctx_i->lib, GGML_OP_ADD).pipeline == NULL) {
++            if (tosh_mgpu_trace()) fprintf(stderr, "oneshot: bail basic i=%zu n=%zu size=%zu\n", i, n, size);
++            return false;
++        }
++
++        // the same pipeline resolution add_inplace_buffer does, hoisted so the args can be
++        // built once: every partner's publish sits at the same slot, so only the buffer bound
++        // at index 2 differs between the n-1 dispatches of one card
++        const bool rb4 = ggml_metal_fb_add_rb() && ggml_nrows(tensors[i]) == 1 && tensors[i]->ne[0] % 4 == 0 &&
++                         ggml_is_contiguous(tensors[i]) && ggml_nelements(tensors[i]) < 65536;
++        struct ggml_metal_pipeline_with_params pl = rb4 ? ggml_metal_pipeline_add_rb4(ctx_i->lib)
++                                                        : ggml_metal_library_get_pipeline_bin_one(ctx_i->lib, GGML_OP_ADD);
++        if (pl.pipeline == NULL) {
++            pl = ggml_metal_library_get_pipeline_bin_one(ctx_i->lib, GGML_OP_ADD);
++            if (pl.pipeline == NULL) {
++                return false;
++            }
++        }
++        pipelines[i] = pl;
++
++        const struct ggml_tensor * acc = tensors[i];
++        args[i] = (ggml_metal_kargs_bin) {
++            /*.ne00 =*/ (int32_t) acc->ne[0],
++            /*.ne01 =*/ (int32_t) acc->ne[1],
++            /*.ne02 =*/ (int32_t) acc->ne[2],
++            /*.ne03 =*/ (int32_t) acc->ne[3],
++            /*.nb00 =*/ acc->nb[0],
++            /*.nb01 =*/ acc->nb[1],
++            /*.nb02 =*/ acc->nb[2],
++            /*.nb03 =*/ acc->nb[3],
++            /*.ne10 =*/ (int32_t) acc->ne[0],
++            /*.ne11 =*/ (int32_t) acc->ne[1],
++            /*.ne12 =*/ (int32_t) acc->ne[2],
++            /*.ne13 =*/ (int32_t) acc->ne[3],
++            /*.nb10 =*/ acc->nb[0],
++            /*.nb11 =*/ acc->nb[1],
++            /*.nb12 =*/ acc->nb[2],
++            /*.nb13 =*/ acc->nb[3],
++            /*.ne0  =*/ (int32_t) acc->ne[0],
++            /*.ne1  =*/ (int32_t) acc->ne[1],
++            /*.ne2  =*/ (int32_t) acc->ne[2],
++            /*.ne3  =*/ (int32_t) acc->ne[3],
++            /*.nb0  =*/ acc->nb[0],
++            /*.nb1  =*/ acc->nb[1],
++            /*.nb2  =*/ acc->nb[2],
++            /*.nb3  =*/ acc->nb[3],
++            /*.offs =*/ 0,
++            /*.o1   =*/ { slot },
++        };
++        if (pl.c4) {
++            args[i].ne00 /= 4;
++            args[i].ne10 /= 4;
++            args[i].ne0  /= 4;
++        }
++
++        for (size_t j = 0; j < n; j++) {
++            if (j == i) {
++                continue;
++            }
++            ggml_metal_t ctx_j = ctxs[j];
++
++            out_l[i][j] = ggml_metal_xdev_link_get(ctx_i, ctx_j);
++            in_l[i][j]  = ggml_metal_xdev_link_get(ctx_j, ctx_i);
++            if (out_l[i][j] == NULL || in_l[i][j] == NULL) {
++                if (tosh_mgpu_trace()) fprintf(stderr, "oneshot: bail link i=%zu j=%zu\n", i, j);
++                return false;
++            }
++            prev[i][j] = out_l[i][j]->x_slot[sp];
++
++            // one host block per link, both devices' views of it, reserved up front so no
++            // card can fail on allocation after a partner has already committed.
++            // the in-direction is a different directed link and would otherwise be checked
++            // (here) before it is reserved (at iteration j,i), so reserve it now too
++            if (!ggml_metal_xdev_link_reserve(ctx_i, ctx_j, out_l[i][j], 2 * size) ||
++                !ggml_metal_xdev_link_reserve(ctx_j, ctx_i, in_l[i][j], 2 * size)) {
++                if (tosh_mgpu_trace()) fprintf(stderr, "oneshot: bail reserve i=%zu j=%zu\n", i, j);
++                return false;
++            }
++            if (out_l[i][j]->cap < 2 * size || in_l[i][j]->cap < 2 * size) {
++                if (tosh_mgpu_trace()) fprintf(stderr, "oneshot: bail cap i=%zu j=%zu cap=%zu/%zu need=%zu\n",
++                                               i, j, out_l[i][j]->cap, in_l[i][j]->cap, 2*size);
++                return false;
++            }
++        }
++    }
++
++    static bool logged = false;
++    if (!logged) {
++        logged = true;
++        fprintf(stderr, "ggml_metal: one-shot all-reduce enabled for %zu-card groups\n", n);
++    }
++
++    for (size_t i = 0; i < n; i++) {
++        ggml_metal_t ctx_i = ctxs[i];
++        struct ggml_tensor * t_self = tensors[i];
++        const uint64_t t_enter = tosh_mgpu_trace() ? tosh_now_ns() : 0;
++
++        @autoreleasepool {
++            id<MTLCommandBuffer> cmd_buf = ggml_metal_cmd_buf_continue(ctx_i);
++
++            // back-pressure names the last round this very link was used at, the same
++            // protocol the staged exchange uses: seq comes from a group-wide counter and a
++            // link only sees a fraction of the values, so a fixed seq-2 could name a round
++            // that link never signalled. prev[] was captured before any card re-stamped it.
++            if (!ggml_metal_collective_nowait()) {
++                for (size_t j = 0; j < n; j++) {
++                    if (j == i) {
++                        continue;
++                    }
++                    if (prev[i][j] == 0) {
++                        continue;
++                    }
++                    if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
++                    if (ggml_metal_bp_satisfied()) {
++                        [cmd_buf encodeWaitForEvent:tosh_wait_dummy(ctx_i) value:1];
++                    } else {
++                        [cmd_buf encodeWaitForEvent:out_l[i][j]->ev_x_done value:prev[i][j]];
++                    }
++                }
++            }
++
++            // publish before waiting: every card signals every partner first, so no subset
++            // of the group can sit on an event the rest are waiting behind.
++            // one blit encoder for all partners, one compute encoder for all adds; encoder
++            // switches are a known per-dispatch cost on this stack and the staged round
++            // spends only ~2 dispatches, so paying them n-1 times was the regression
++            struct ggml_metal_buffer_id bid_self = ggml_metal_get_buffer_id(t_self);
++
++            {
++                id<MTLBlitCommandEncoder> enc_blit = [cmd_buf blitCommandEncoder];
++                // an empty-slice partial joins the sum as zeros, filled in this same encoder
++                if (zero_mask & (1u << i)) {
++                    [enc_blit fillBuffer:bid_self.metal range:NSMakeRange(bid_self.offs, size) value:0];
++                }
++                for (size_t j = 0; j < n; j++) {
++                    if (j == i) {
++                        continue;
++                    }
++                    [enc_blit copyFromBuffer:bid_self.metal sourceOffset:bid_self.offs
++                                    toBuffer:out_l[i][j]->wrap_src destinationOffset:slot size:size];
++                }
++                [enc_blit endEncoding];
++            }
++            for (size_t j = 0; j < n; j++) {
++                if (j == i) {
++                    continue;
++                }
++                if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
++                [cmd_buf encodeSignalEvent:out_l[i][j]->ev_x_ready value:seq];
++            }
++            for (size_t j = 0; j < n; j++) {
++                if (j == i) {
++                    continue;
++                }
++                if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
++                if (ggml_metal_collective_nowait() || ggml_metal_wait_satisfied()) {
++                    [cmd_buf encodeWaitForEvent:tosh_wait_dummy(ctx_i) value:1];
++                } else {
++                    [cmd_buf encodeWaitForEvent:in_l[i][j]->ev_x_ready value:seq];
++                }
++            }
++
++            {
++                ggml_metal_encoder_t enc = ggml_metal_encoder_init((ggml_metal_cmd_buf_t) cmd_buf, false);
++
++                ggml_metal_encoder_set_pipeline(enc, pipelines[i]);
++                ggml_metal_encoder_set_bytes   (enc, &args[i], sizeof(args[i]), 0);
++                ggml_metal_encoder_set_buffer  (enc, bid_self, 1);
++                ggml_metal_encoder_set_buffer  (enc, bid_self, 3);
++
++                for (size_t j = 0; j < n; j++) {
++                    if (j == i) {
++                        continue;
++                    }
++                    struct ggml_metal_buffer_id bid_add = { .metal = in_l[i][j]->wrap_dst, .offs = 0 };
++                    ggml_metal_encoder_set_buffer(enc, bid_add, 2);
++
++                    if (pipelines[i].cnt) {
++                        ggml_metal_encoder_dispatch_threadgroups(enc, args[i].ne0, (int) ggml_nrows(t_self), 1, 1, 1, 1);
++                    } else {
++                        const int nth_max = MIN(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipelines[i]));
++
++                        int nth = 1;
++                        while (2*nth < args[i].ne0 && nth < nth_max) {
++                            nth *= 2;
++                        }
++
++                        ggml_metal_encoder_dispatch_threadgroups(enc, args[i].ne01, args[i].ne02, args[i].ne03, nth, 1, 1);
++                    }
++                }
++
++                ggml_metal_encoder_end_encoding(enc);
++                ggml_metal_encoder_free(enc);
++            }
++            for (size_t j = 0; j < n; j++) {
++                if (j == i) {
++                    continue;
++                }
++                if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
++                [cmd_buf encodeSignalEvent:in_l[i][j]->ev_x_done value:seq];
++            }
++
++    // stamp every link only after every card has encoded: all four contexts live in one
++    // address space, so an early stamp would make a later card wait on a value its partner
++    // is about to signal behind that very wait
++    for (size_t i = 0; i < n; i++) {
++        for (size_t j = 0; j < n; j++) {
++            if (j != i) {
++                out_l[i][j]->seq_x   = seq;
++                out_l[i][j]->x_slot[sp] = seq;
++            }
++        }
++    }
++
++            tosh_trace_cmd_buf(cmd_buf);
++            tosh_trace_exchange(cmd_buf, seq, (int) (([(id<MTLDevice>) ggml_metal_device_get_obj(ctx_i->dev) peerIndex]) & 1));
++            ggml_metal_cmd_buf_end(ctx_i, cmd_buf, ggml_metal_collective_hold_batch(tosh_batch_of(t_self)));
++        }
++
++        if (tosh_mgpu_trace()) {
++            atomic_fetch_add(&g_tr_reduce, 1);
++            atomic_fetch_add(&g_tr_bytes_host, 2 * size * (n - 1));
++            atomic_fetch_add(&g_tr_encode_ns, tosh_now_ns() - t_enter);
++        }
++    }
++
++    if (tosh_mgpu_trace()) {
++        atomic_fetch_add(&g_tr_oneshot, 1);
++    }
++
++    return true;
++#else
++    GGML_UNUSED(ctxs); GGML_UNUSED(tensors); GGML_UNUSED(n); GGML_UNUSED(seq); GGML_UNUSED(zero_mask);
++    return false;
++#endif
++}
++
+ // A buffer per copy is most of what a token creates, and creating one contends on Metal's
+ // shared pools. Every card signals before it waits, so no pair can lock up.
++bool ggml_metal_xdev_prepare(ggml_metal_t ctx_self, ggml_metal_t ctx_peer, size_t size) {
++    struct ggml_metal_xdev_link * link_out = ggml_metal_xdev_link_get(ctx_self, ctx_peer);
++    struct ggml_metal_xdev_link * link_in  = ggml_metal_xdev_link_get(ctx_peer, ctx_self);
++    if (link_out == NULL || link_in == NULL) {
++        return false;
++    }
++    return ggml_metal_xdev_link_reserve(ctx_self, ctx_peer, link_out, size) &&
++           ggml_metal_xdev_link_reserve(ctx_peer, ctx_self, link_in,  size);
++}
++
+ bool ggml_metal_exchange_reduce(ggml_metal_t ctx_self, ggml_metal_t ctx_peer,
+                                 struct ggml_tensor * t_self, struct ggml_tensor * t_peer,
+                                 struct ggml_tensor * tmp_self, uint64_t seq) {
+     struct ggml_metal_xdev_link * link_out = ggml_metal_xdev_link_get(ctx_self, ctx_peer);
+     struct ggml_metal_xdev_link * link_in  = ggml_metal_xdev_link_get(ctx_peer, ctx_self);
+     if (link_out == NULL || link_in == NULL) {
+         return false;
+     }
+@@ -2811,16 +3148,20 @@ bool ggml_metal_exchange_reduce(ggml_metal_t ctx_self, ggml_metal_t ctx_peer,
+     // Both sides are handed the same number: reading it off the link races with whichever
+     // card the loop reached first. Links skip values, so the back-pressure wait names its own.
+     // its own events and counter: the copies number per link and this path numbers by round,
+     // and one event cannot carry both without a value landing below the last one signalled
+     const uint64_t seq_prev = link_out->seq_x;
+     const uint64_t seq_out  = seq;
+     const uint64_t seq_in   = seq;
+     link_out->seq_x = seq;
++    // the staged exchange writes offset 0, which is the one-shot's even slot, and a prefill
++    // payload can span the odd one too. both slot trackers have to know a publish landed here
++    link_out->x_slot[0] = seq;
++    link_out->x_slot[1] = seq;
+ 
+     @autoreleasepool {
+         id<MTLCommandBuffer> cmd_buf = ggml_metal_cmd_buf_continue(ctx_self);
+ 
+         if (seq_prev > 0) {
+             if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
+             if (ggml_metal_bp_satisfied()) {
+                 [cmd_buf encodeWaitForEvent:tosh_wait_dummy(ctx_self) value:1];
+diff --git a/ggml/src/ggml-metal/ggml-metal.cpp b/ggml/src/ggml-metal/ggml-metal.cpp
+index c90cb36e3..348a24c1e 100644
+--- a/ggml/src/ggml-metal/ggml-metal.cpp
++++ b/ggml/src/ggml-metal/ggml-metal.cpp
+@@ -12,16 +12,20 @@
+ static inline void tosh_moe_set_host_buft(const void *) {}
+ #endif
+ #include "ggml-metal-context.h"
+ #include "ggml-metal-ops.h"
+ #include "ggml-metal-tuning.h"
+ 
+ #include <mutex>
+ #include <string>
++#ifdef __APPLE__
++#include <dispatch/dispatch.h>
++#include <atomic>
++#endif
+ 
+ #define GGML_METAL_NAME "MTL"
+ #define GGML_METAL_MAX_DEVICES 16
+ 
+ // number of Metal devices
+ // note: can be overridden with GGML_METAL_DEVICES env to simulate virtual devices
+ static int g_devices = 1;
+ 
+@@ -1088,48 +1092,64 @@ static bool ggml_backend_metal_comm_allreduce_noop(void) {
+         if (v) {
+             fprintf(stderr, "ggml_metal: WARNING TOSH_MGPU_ALLREDUCE_NOOP=1, the reduction is "
+                             "skipped and the output is meaningless. Benchmark only.\n");
+         }
+     }
+     return v == 1;
+ }
+ 
++// Round number for every collective the comm layer runs, one-shot rounds and staged exchanges
++// alike. The links order on it, so the two paths must draw from the same counter: links may
++// skip values but a value must never go backwards or land below one already signalled.
++static uint64_t g_metal_comm_seq = 0;
++
+ static bool ggml_backend_metal_comm_allreduce_tensor(void * comm_ctx_v, ggml_tensor ** tensors) {
+     if (ggml_backend_metal_comm_allreduce_noop()) {
+         return true;
+     }
+ 
+     auto * comm_ctx = (ggml_backend_metal_comm_context *) comm_ctx_v;
+ 
+     const size_t n_backends = comm_ctx->backends.size();
+ 
++    static int tosh_trace_al = -1;
++    if (tosh_trace_al < 0) { tosh_trace_al = getenv("TOSH_MGPU_TRACE") ? 1 : 0; }
++
+     if (tensors[0] == nullptr || tensors[0]->type != GGML_TYPE_F32) {
++        if (tosh_trace_al) fprintf(stderr, "allreduce bail: t0=%p type=%d\n", (void*)tensors[0], tensors[0] ? (int)tensors[0]->type : -1);
+         return false;
+     }
+ 
+     const int64_t ne = ggml_nelements(tensors[0]);
+     if (ne == 0) {
+         return true;
+     }
+ 
++    // a device with an empty slice carries the node but never computes it, so its memory is
++    // stale scratch. The generic butterfly zeroes those before the add; the metal path now
++    // does the same with a blit fill instead of handing the whole collective to the fallback.
++    size_t zero_mask = 0;
++
+     for (size_t i = 0; i < n_backends; i++) {
+         ggml_tensor * t = tensors[i];
+         if (t == nullptr || t->type != GGML_TYPE_F32 || ggml_nelements(t) != ne) {
++            if (tosh_trace_al) fprintf(stderr, "allreduce bail: elem i=%zu ne=%lld\n", i, t ? (long long)ggml_nelements(t) : -1);
+             return false;
+         }
+         if (!ggml_are_same_shape(t, tensors[0]) || !ggml_is_contiguous(t)) {
++            if (tosh_trace_al) fprintf(stderr, "allreduce bail: shape/contig i=%zu %s\n", i, t->name);
+             return false;
+         }
+         if (!ggml_backend_buffer_is_metal(t->buffer)) {
++            if (tosh_trace_al) fprintf(stderr, "allreduce bail: buft i=%zu %s\n", i, t->name);
+             return false;
+         }
+-        // a device with an empty slice contributes nothing and the generic path zeroes it
+         if (!(t->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+-            return false;
++            zero_mask |= (size_t) 1 << i;
+         }
+     }
+ 
+     const size_t size = ggml_nbytes(tensors[0]);
+     const size_t n_steps = comm_ctx->n_steps;
+ 
+     for (size_t k = 0; k < n_backends*n_steps; k++) {
+         if (comm_ctx->tmp_size[k] < size) {
+@@ -1156,32 +1176,59 @@ static bool ggml_backend_metal_comm_allreduce_tensor(void * comm_ctx_v, ggml_ten
+         tmp[i].src[0]    = nullptr;
+         tmp[i].src[1]    = nullptr;
+     };
+ 
+     for (size_t i = 0; i < n_backends; i++) {
+         view_tmp(i, 0);
+         ggml_metal_t ctx = (ggml_metal_t) comm_ctx->backends[i]->context;
+         if (!ggml_metal_add_inplace_supported(ctx, tensors[i], &tmp[i])) {
++            if (tosh_trace_al) fprintf(stderr, "allreduce bail: add_inplace i=%zu %s op=%s\n", i, tensors[i]->name, ggml_op_name(tensors[i]->op));
+             return false;
+         }
+     }
+ 
+     // The peer copy has the higher bandwidth and the event hand-off the lower fixed cost, so
+     // the batch decides: peer wins the prefill, events the decode.
+     const bool prefer_events = ne / tensors[0]->ne[0] < ggml_metal_peer_min_batch();
+ 
+     // the add goes into the command buffer the copy already opened; kill switch because that
+     // buffer stays open between the two calls
+     static int fuse = -1;
+     if (fuse < 0) {
+         fuse = getenv("TOSH_MGPU_FUSE_ADD_DISABLE") == NULL ? 1 : 0;
+     }
+     const bool hold_dst = fuse == 1;
+ 
++    // Decode batches reduce in one round: every card pushes its partial into every partner's
++    // inbox and sums from local VRAM, instead of the butterfly's log2(n) host-staged rounds.
++    // The staged round trips are pure latency at 16 KiB, which is why TP4 decode loses to one
++    // card today. Encodes nothing and falls through if the hive is not peer-direct.
++    if (prefer_events && n_backends >= 2 && n_backends <= 4) {
++        ggml_metal_t ctxs[4];
++        for (size_t i = 0; i < n_backends; i++) {
++            ctxs[i] = (ggml_metal_t) comm_ctx->backends[i]->context;
++        }
++        if (ggml_metal_allreduce_oneshot(ctxs, tensors, n_backends, g_metal_comm_seq + 1, (uint32_t) zero_mask)) {
++            g_metal_comm_seq++;
++            return true;
++        }
++    }
++
++    // The one-shot encodes its own zero fills in the merged blit encoder; only paths that
++    // continue past it need the standalone ones, and they must land before the first publish.
++    for (size_t i = 0; i < n_backends; i++) {
++        if (zero_mask & ((size_t) 1 << i)) {
++            ggml_metal_t ctx = (ggml_metal_t) comm_ctx->backends[i]->context;
++            if (!ggml_metal_zero_tensor(ctx, tensors[i])) {
++                return false;
++            }
++        }
++    }
++
+     // Bailing out is only safe while no device has reduced anything: past that the generic
+     // path would add the partial sums a second time.
+     bool reduced = false;
+     auto push = [&](size_t j_src, size_t j_dst, size_t step, bool hold) {
+         view_tmp(j_dst, step);
+         const bool ok = ggml_backend_metal_cpy_tensor_async_ex(comm_ctx->backends[j_src], comm_ctx->backends[j_dst],
+                                                               tensors[j_src], &tmp[j_dst], prefer_events, hold);
+         if (!ok && reduced) {
+@@ -1224,39 +1271,81 @@ static bool ggml_backend_metal_comm_allreduce_tensor(void * comm_ctx_v, ggml_ten
+     // so the copies all go out before any of the adds.
+     static int fused = -1;
+     if (fused < 0) {
+         fused = getenv("TOSH_MGPU_FUSED_EXCHANGE_DISABLE") == NULL ? 1 : 0;
+     }
+ 
+     for (size_t offset = offset_max; offset >= 1; offset /= 2) {
+         if (fused && prefer_events) {
+-            static uint64_t seq_round = 0;
+-            seq_round++;
++            g_metal_comm_seq++;
++            const uint64_t seq_round = g_metal_comm_seq;
+             bool ok = true;
+             for (size_t j = 0; j < 2*offset_max; j++) {
+                 view_tmp(j, step);
+             }
+             // Only the tensor-to-tensor variant needs the partner's tensor, and it is the one
+             // that would thrash its view cache when a step's partner changes between rounds,
+             // so it is handed the partner for a pair and nothing otherwise. The default path
+             // publishes into an inbox instead and engages at any device count: on four dies it
+             // takes the two intra-card links and leaves the cross-card ones to the staged path,
+             // which is what a two-card TensorMesh row already relies on.
+             const bool pair = 2*offset_max == 2;
++            // links and their staging blocks are created lazily; two threads racing through
++            // exchange_reduce on the same pair would both try to create the shared link, so
++            // materialize and reserve every directed pair of this round serially first
++            for (size_t j = 0; j < 2*offset_max && ok; j++) {
++                ggml_metal_t ctx_j    = (ggml_metal_t) comm_ctx->backends[j]->context;
++                ggml_metal_t ctx_peer = (ggml_metal_t) comm_ctx->backends[j ^ offset]->context;
++                ok = ggml_metal_xdev_prepare(ctx_j, ctx_peer, size);
++            }
++            if (!ok) {
++                return false;
++            }
+             // TOSH_MGPU_SUBMIT_ORDER, benchmark only: 0 normal, 1 reversed, 2 alternating.
+-            // The loop below is serial on the host while ordinary subgraphs have been encoded
+-            // concurrently since patch 0017, so the side encoded first can reach the GPU well
+-            // ahead of the other. These modes make that visible without touching semantics.
++            // With the encodes on GCD threads the order is advisory, and the modes only mean
++            // anything for the serial path below (which mirrors pre-parallelism behaviour).
+             static int order = -1;
+             if (order < 0) {
+                 const char * v = getenv("TOSH_MGPU_SUBMIT_ORDER");
+                 order = v ? atoi(v) : 0;
+             }
+             const bool flip = order == 1 || (order == 2 && (seq_round & 1));
++
++            // TOSH_MGPU_COMM_PARALLEL=1 fans the round's exchanges out on GCD threads.
++            // Default off: measured worse at both device counts (TP2 41 vs 57, TP4 36.5 vs
++            // 38.0, with ±9 t/s variance) - the per-card encodes are too short to pay for
++            // the thread handoff, and concurrent event encoding on peer-group devices shows
++            // driver contention. Kept because the failure mode is a clue for later work.
++            static int comm_parallel = -1;
++            if (comm_parallel < 0) {
++                const char * s_cp = getenv("TOSH_MGPU_COMM_PARALLEL");
++                comm_parallel = s_cp ? atoi(s_cp) : 0;
++            }
++#ifdef __APPLE__
++            if (comm_parallel) {
++                // C++ blocks capture by value, so hand the block only pointers and scalars,
++                // same pattern the meta layer's parallel encode uses
++                std::atomic<bool> failed{ false };
++                std::atomic<bool> * p_failed = &failed;
++                ggml_tensor * tmp_data = tmp.data();
++                dispatch_apply(2*offset_max, DISPATCH_APPLY_AUTO, ^(size_t jj) {
++                    if (p_failed->load(std::memory_order_relaxed)) {
++                        return;
++                    }
++                    const size_t j = flip ? (2*offset_max - 1 - jj) : jj;
++                    if (!ggml_backend_metal_exchange_reduce(comm_ctx->backends[j], comm_ctx->backends[j ^ offset],
++                                                            tensors[j], pair ? tensors[j ^ offset] : nullptr,
++                                                            &tmp_data[j], seq_round)) {
++                        p_failed->store(true, std::memory_order_relaxed);
++                    }
++                });
++                ok = !failed.load(std::memory_order_relaxed);
++            } else
++#endif
+             for (size_t jj = 0; jj < 2*offset_max && ok; jj++) {
+                 const size_t j = flip ? (2*offset_max - 1 - jj) : jj;
+                 ok = ggml_backend_metal_exchange_reduce(comm_ctx->backends[j], comm_ctx->backends[j ^ offset],
+                                                         tensors[j], pair ? tensors[j ^ offset] : nullptr,
+                                                         &tmp[j], seq_round);
+             }
+             if (ok) {
+                 reduced = true;

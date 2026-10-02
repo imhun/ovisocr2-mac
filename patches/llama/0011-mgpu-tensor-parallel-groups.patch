@@ -1,0 +1,144 @@
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 5ea0dc359..e4a943818 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -249,22 +249,24 @@ ggml_backend_dev_t ggml_backend_meta_device(
+ //
+ 
+ struct ggml_backend_meta_buffer_type_context {
+     std::vector<ggml_backend_buffer_type_t> simple_bufts;
+ 
+     std::string name;
+ 
+     ggml_backend_meta_buffer_type_context(std::vector<ggml_backend_buffer_type_t> simple_bufts) : simple_bufts(std::move(simple_bufts)) {
++        // the member, not the parameter, which was just moved from. llama.cpp keys its
++        // per-buffer-type context map on this name, so an empty one puts every group in one buffer.
+         name = "Meta(";
+-        for (size_t i = 0; i < simple_bufts.size(); i++) {
++        for (size_t i = 0; i < this->simple_bufts.size(); i++) {
+             if (i > 0) {
+                 name += ",";
+             }
+-            name += ggml_backend_buft_name(simple_bufts[i]);
++            name += ggml_backend_buft_name(this->simple_bufts[i]);
+         }
+         name += ")";
+     }
+ 
+     bool operator<(const ggml_backend_meta_buffer_type_context & other) const {
+         return simple_bufts < other.simple_bufts;
+     }
+ };
+diff --git a/src/llama.cpp b/src/llama.cpp
+index ad8e44388..da2ef8f2f 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -149,16 +149,40 @@ void llama_numa_init(enum ggml_numa_strategy numa) {
+ void llama_backend_free(void) {
+     ggml_quantize_free();
+ }
+ 
+ int64_t llama_time_us(void) {
+     return ggml_time_us();
+ }
+ 
++// Tensor parallelism across every device drops generation as 1/N, because a synchronisation point
++// costs the same whatever it carries. Grouping the devices keeps the tensor split inside each
++// group and the layer split between groups, which trades some prefill for most of the generation
++// back. TOSH_MGPU_TENSOR_GROUP is the group size; unset or 0 keeps one group, as before.
++static size_t llama_tensor_group_size(size_t n_devs) {
++    const char * s = getenv("TOSH_MGPU_TENSOR_GROUP");
++    if (s == nullptr) {
++        return n_devs;
++    }
++
++    const long g = atol(s);
++    if (g <= 0 || (size_t) g >= n_devs) {
++        return n_devs;
++    }
++
++    if (n_devs % (size_t) g != 0) {
++        LLAMA_LOG_WARN("%s: TOSH_MGPU_TENSOR_GROUP=%ld does not divide %zu devices, using one group\n",
++                __func__, g, n_devs);
++        return n_devs;
++    }
++
++    return (size_t) g;
++}
++
+ // returns true on success
+ static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
+     // create list of devices to use with this model
+     if (params.devices) {
+         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+             size_t n_devs = 0;
+             while (params.devices[n_devs]) {
+                 n_devs++;
+@@ -166,22 +190,28 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
+             if (n_devs == 0) {
+                 LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
+                 return false;
+             }
+             LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices\n", __func__, n_devs);
+             for (size_t i = 0; i < n_devs; ++i) {
+                 LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));
+             }
+-            model->get_split_state_ud.n_devices = n_devs;
++            const size_t n_group = llama_tensor_group_size(n_devs);
++            if (n_group < n_devs) {
++                LLAMA_LOG_INFO("%s: grouping them into %zu Meta devices of %zu\n", __func__, n_devs/n_group, n_group);
++            }
++            model->get_split_state_ud.n_devices = n_group;
+             model->get_split_state_ud.model = model;
+-            model->devices.push_back({
+-                true, ggml_backend_meta_device(
+-                params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
+-            });
++            for (size_t base = 0; base < n_devs; base += n_group) {
++                model->devices.push_back({
++                    true, ggml_backend_meta_device(
++                    params.devices + base, n_group, llama_meta_device_get_split_state, &model->get_split_state_ud)
++                });
++            }
+         } else {
+             for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
+                 model->devices.push_back({false, *dev});
+             }
+         }
+     } else {
+         // default device selection
+ 
+@@ -207,22 +237,28 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
+             }
+ 
+             LLAMA_LOG_INFO("%s: creating a Meta device for tensor parallelism from %zu devices:\n", __func__, devs.size());
+             for (size_t i = 0; i < devs.size(); ++i) {
+                 LLAMA_LOG_INFO("%s: - device %zu: %s (%s)\n", __func__, i, ggml_backend_dev_name(devs[i]), ggml_backend_dev_description(devs[i]));
+             }
+ 
+             GGML_ASSERT(!devs.empty());
+-            model->get_split_state_ud.n_devices = devs.size();
+             model->get_split_state_ud.model     = model;
+-            gpus.push_back({
+-                true, ggml_backend_meta_device(
+-                devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)
+-            });
++            const size_t n_group = llama_tensor_group_size(devs.size());
++            if (n_group < devs.size()) {
++                LLAMA_LOG_INFO("%s: grouping them into %zu Meta devices of %zu\n", __func__, devs.size()/n_group, n_group);
++            }
++            model->get_split_state_ud.n_devices = n_group;
++            for (size_t base = 0; base < devs.size(); base += n_group) {
++                gpus.push_back({
++                    true, ggml_backend_meta_device(
++                    devs.data() + base, n_group, llama_meta_device_get_split_state, &model->get_split_state_ud)
++                });
++            }
+         } else {
+             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                 switch (ggml_backend_dev_type(dev)) {
+                     case GGML_BACKEND_DEVICE_TYPE_CPU:
+                     case GGML_BACKEND_DEVICE_TYPE_ACCEL:
+                         // skip CPU backends since they are handled separately
+                         break;

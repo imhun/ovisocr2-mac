@@ -1,0 +1,96 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 6088ac849..f619a1f27 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -253,17 +253,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_repeat(ggml_meta
+ 
+     return res;
+ }
+ 
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat(ggml_metal_library_t lib, ggml_type tsrc) {
+     char base[256];
+     char name[256];
+ 
+-    snprintf(base, 256, "kernel_concat_%s", ggml_type_name(tsrc));
++    const auto * props = ggml_metal_device_get_props(ggml_metal_library_get_device(lib));
++
++    // only the block types that are not a multiple of four bytes have an aligned variant
++    const bool align = props->needs_aligned_loads &&
++        (tsrc == GGML_TYPE_Q4_0 || tsrc == GGML_TYPE_Q5_0 || tsrc == GGML_TYPE_Q8_0);
++
++    snprintf(base, 256, "kernel_concat_%s%s", ggml_type_name(tsrc), align ? "_al" : "");
+     snprintf(name, 256, "%s", base);
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+     if (!res.pipeline) {
+         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+     }
+ 
+     return res;
+diff --git a/ggml/src/ggml-metal/kernels/quantize.metal b/ggml/src/ggml-metal/kernels/quantize.metal
+index cfb3945ef..141be8744 100644
+--- a/ggml/src/ggml-metal/kernels/quantize.metal
++++ b/ggml/src/ggml-metal/kernels/quantize.metal
+@@ -297,16 +297,62 @@ kernel void kernel_concat_q(
+ typedef decltype(kernel_concat_q<block_q4_0>) kernel_concat_q_t;
+ 
+ template [[host_name("kernel_concat_q4_0")]] kernel kernel_concat_q_t kernel_concat_q<block_q4_0>;
+ template [[host_name("kernel_concat_q4_1")]] kernel kernel_concat_q_t kernel_concat_q<block_q4_1>;
+ template [[host_name("kernel_concat_q5_0")]] kernel kernel_concat_q_t kernel_concat_q<block_q5_0>;
+ template [[host_name("kernel_concat_q5_1")]] kernel kernel_concat_q_t kernel_concat_q<block_q5_1>;
+ template [[host_name("kernel_concat_q8_0")]] kernel kernel_concat_q_t kernel_concat_q<block_q8_0>;
+ 
++// Blocks whose size is not a multiple of four are copied a short at a time: older GCN cards
++// read a dword off a word boundary as the aligned one.
++template<typename block_q>
++kernel void kernel_concat_q_al(
++        constant ggml_metal_kargs_concat & args,
++        device  const char * src0,
++        device  const char * src1,
++        device        char * dst,
++        uint3   tgpig[[threadgroup_position_in_grid]],
++        ushort3 tpitg[[thread_position_in_threadgroup]],
++        ushort3   ntg[[threads_per_threadgroup]]) {
++
++    const int i3 = tgpig.z;
++    const int i2 = tgpig.y;
++    const int i1 = ntg.y == 1 ? tgpig.x : tgpig.x*ntg.y + tpitg.y;
++
++    if (i1 >= args.ne1) {
++        return;
++    }
++
++    int o[4] = {0, 0, 0, 0};
++    o[args.dim] = args.dim == 0 ? args.ne00 : (args.dim == 1 ? args.ne01 : (args.dim == 2 ? args.ne02 : args.ne03));
++
++    for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
++        device const ushort * x;
++
++        if (i0 < args.ne00 && i1 < args.ne01 && i2 < args.ne02 && i3 < args.ne03) {
++            x = (device const ushort *)(src0 + (i3       )*args.nb03 + (i2       )*args.nb02 + (i1       )*args.nb01 + (i0       )*args.nb00);
++        } else {
++            x = (device const ushort *)(src1 + (i3 - o[3])*args.nb13 + (i2 - o[2])*args.nb12 + (i1 - o[1])*args.nb11 + (i0 - o[0])*args.nb10);
++        }
++
++        device ushort * y = (device ushort *)(dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0);
++
++        for (short k = 0; k < (short) (sizeof(block_q)/2); ++k) {
++            y[k] = x[k];
++        }
++    }
++}
++
++typedef decltype(kernel_concat_q_al<block_q4_0>) kernel_concat_q_al_t;
++
++template [[host_name("kernel_concat_q4_0_al")]] kernel kernel_concat_q_al_t kernel_concat_q_al<block_q4_0>;
++template [[host_name("kernel_concat_q5_0_al")]] kernel kernel_concat_q_al_t kernel_concat_q_al<block_q5_0>;
++template [[host_name("kernel_concat_q8_0_al")]] kernel kernel_concat_q_al_t kernel_concat_q_al<block_q8_0>;
++
+ template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
+ kernel void kernel_get_rows_q(
+         constant ggml_metal_kargs_get_rows & args,
+         device const void * src0,
+         device const void * src1,
+         device       void * dst,
+         uint3               tgpig[[threadgroup_position_in_grid]],
+         ushort              tiitg[[thread_index_in_threadgroup]],

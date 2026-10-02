@@ -1,0 +1,27 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index a8013d8a6..cf01ebbc4 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -432,19 +432,19 @@ llama_context::llama_context(
+             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
+             cparams.offload_kqv &&
+             !model.has_tensor_overrides();
+ 
+         // pipeline parallelism requires support for async compute and events in all devices
+         if (pipeline_parallel) {
+             for (auto & backend : backends) {
+                 auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
+-                if (dev_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
+-                    // ignore CPU backend
+-                    // TODO: should we ignore ACCEL types too?
++                if (dev_type == GGML_BACKEND_DEVICE_TYPE_CPU || dev_type == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
++                    // ignore CPU and ACCEL backends: BLAS is always present on macOS and reports
++                    // neither async nor events, which switched pipeline parallelism off for the GPUs
+                     continue;
+                 }
+                 auto * dev = ggml_backend_get_device(backend.get());
+                 ggml_backend_dev_props props;
+                 ggml_backend_dev_get_props(dev, &props);
+                 if (!props.caps.async || !props.caps.events) {
+                     // device does not support async compute or events
+                     pipeline_parallel = false;

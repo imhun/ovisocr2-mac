@@ -1,0 +1,27 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index d10b22598..017f19dd2 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -3168,17 +3168,21 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+     }
+ 
+     return 1;
+ }
+ 
+ size_t ggml_metal_op_mul_mat_id_extra_tpe(const ggml_tensor * op) {
+     assert(op->op == GGML_OP_MUL_MAT_ID);
+ 
+-    const int64_t ne02 = op->src[0]->ne[2]; // n_expert
++    // With a split bank src0 holds the slots, not the experts, and the id map is built over
++    // the full expert count. Size this the same way as the ids region below, or map0 writes
++    // past it and into the ids that follow.
++    const int registered = tosh_moe_experts_of(op->src[0]);
++    const int64_t ne02 = registered > 0 ? registered : op->src[0]->ne[2]; // n_expert
+ 
+     return ggml_type_size(GGML_TYPE_I32)*ne02;
+ }
+ 
+ size_t ggml_metal_op_mul_mat_id_extra_ids(const ggml_tensor * op) {
+     assert(op->op == GGML_OP_MUL_MAT_ID);
+ 
+     const int registered = tosh_moe_experts_of(op->src[0]);

@@ -1,0 +1,90 @@
+diff --git a/common/tosh-plan.cpp b/common/tosh-plan.cpp
+index a9b6be767..6e705a9e8 100644
+--- a/common/tosh-plan.cpp
++++ b/common/tosh-plan.cpp
+@@ -36,10 +36,12 @@ static constexpr double RESERVE_MAX_MIB  = 1536.0;
+ // RAM left to the rest of the system once a plan's host memory is taken
+ static constexpr double HOST_MARGIN_MIB  = 2048.0;
+ // experimental bounded host cache: (VRAM arena + RAM cache) / bank below this streams every token
+ static constexpr double BOUNDED_MIN_COVERAGE  = 1.0;
+ static constexpr double BOUNDED_GOOD_COVERAGE = 1.25;
++// TOSH_AUTO_HOST_BANK=lean: RAM holds the experts the VRAM arena does not, plus this margin
++static constexpr double LEAN_COVERAGE         = 1.08;
+ // reclaimable RAM lost between the snapshot and the commit that makes the plan stale
+ static constexpr double STALE_DROP_MIB = 1024.0;
+ 
+ namespace {
+ 
+@@ -205,10 +207,15 @@ static bool g_runtime_default = false;
+ bool host_policy_runtime() {
+     const char * v = getenv("TOSH_AUTO_HOST_POLICY");
+     return v == nullptr ? g_runtime_default : strcmp(v, "runtime") == 0;
+ }
+ 
++static bool host_bank_lean() {
++    const char * v = getenv("TOSH_AUTO_HOST_BANK");
++    return v != nullptr && strcmp(v, "lean") == 0;
++}
++
+ host_mem read_host_info() {
+     host_mem h;
+ #ifdef __APPLE__
+     uint64_t mem = 0; size_t len = sizeof(mem);
+     if (sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) == 0) h.ram_mib = mem/MiB;
+@@ -658,10 +665,11 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+     // runtime host policy: every cap is memory this load may still add; the whole bank only when
+     // it fits all three with the machine calm, else the largest RAM cache that does
+     const double staging_mib = 128.0;
+     double bounded_warm = 0;
+     bool full_host_ok = true;
++    const bool lean = runtime && host_bank_lean();
+     if (runtime) {
+         p.host_policy = "runtime";
+         p.host_simulated = hi.simulated; p.swap_growing = hi.swap_growing;
+         p.reclaimable_mib = hi.reclaimable_mib; p.wired_mib = hi.wired_mib; p.compressed_mib = hi.compressed_mib;
+         p.swap_used_mib = hi.swap_used_mib; p.self_rss_mib = hi.self_rss_mib;
+@@ -674,10 +682,11 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+         p.effective_mib  = std::min(p.static_cap_mib, p.dynamic_cap_mib);
+         p.full_host_code = p.host_pressure != "NORMAL"           ? "HOST_MEMORY_PRESSURE_HIGH" :
+                            host_dmoe > p.static_cap_mib           ? "FULL_HOST_STATIC_LIMIT" :
+                            host_dmoe > p.dynamic_cap_mib          ? "FULL_HOST_CURRENT_RAM_LIMIT" :
+                            mi.bank_mib + p.host_weights_mib > p.lockable_mib ? "FULL_HOST_WIRE_LIMIT" : "FULL_HOST_SAFE";
++        if (lean && p.full_host_code == "FULL_HOST_SAFE") p.full_host_code = "FULL_HOST_NOT_WANTED";
+         full_host_ok = p.full_host_code == "FULL_HOST_SAFE";
+         dmoe_block = full_host_ok ? "" : string_format("%s: %.1f GiB to add, %.1f GiB allowed now", p.full_host_code.c_str(),
+                                                         host_dmoe/1024, std::min(p.effective_mib, p.lockable_mib + host_engine)/1024);
+         if (full_host_ok) {
+             p.bounded_code = "NOT_NEEDED";
+@@ -867,14 +876,15 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+             p.host_required_mib = host_engine;
+             p.mlock = "not_required";
+         } else if (sel->mode == "dmoe" && runtime && !full_host_ok) {
+             p.state = TOSH_PLAN_DMOE_BOUNDED_HOST;
+             p.mode  = "dmoe_bounded";
+-            p.warm_mib = bounded_warm;
+-            p.coverage = (sel->arena_mib + bounded_warm)/mi.bank_mib;
++            p.warm_mib = !lean ? bounded_warm :
++                         std::min(bounded_warm, std::max(mi.warm_floor_mib, mi.bank_mib*LEAN_COVERAGE - sel->arena_mib));
++            p.coverage = (sel->arena_mib + p.warm_mib)/mi.bank_mib;
+             p.bounded_code = p.coverage >= BOUNDED_GOOD_COVERAGE ? "BOUNDED_HOST_COVERAGE_GOOD" : "BOUNDED_HOST_COVERAGE_CONSTRAINED";
+-            p.host_required_mib = host_engine + bounded_warm + staging_mib;
++            p.host_required_mib = host_engine + p.warm_mib + staging_mib;
+             p.fallback = dmoe_block;
+         } else if (sel->mode == "dmoe") {
+             p.state = weights_fit ? TOSH_PLAN_DMOE_CONTEXT_OPTIMAL : TOSH_PLAN_DMOE_CAPACITY_REQUIRED;
+             p.host_required_mib = host_dmoe;
+             if (runtime) p.coverage = (sel->arena_mib + mi.bank_mib)/mi.bank_mib;
+@@ -927,11 +937,12 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+         p.plan_mode = TOSH_PLAN_MODE_CLASSIC_NCMOE;
+         p.primary_reason = "CLASSIC_NCMOE_FALLBACK";
+         p.limiting_resource = has_limit("WIRE_LIMIT") && !has_limit("CURRENT_RAM_LIMIT") ? "WIRE" : dmoe_built ? "HOST_RAM" : "VRAM";
+     } else if (runtime && !full_host_ok) {
+         p.plan_mode = TOSH_PLAN_MODE_BOUNDED_DMOE;
+-        p.primary_reason = p.full_host_code == "FULL_HOST_STATIC_LIMIT" ? "STATIC_RAM_LIMIT" :
++        p.primary_reason = p.full_host_code == "FULL_HOST_NOT_WANTED"   ? "HOST_RAM_SAVING" :
++                           p.full_host_code == "FULL_HOST_STATIC_LIMIT" ? "STATIC_RAM_LIMIT" :
+                            p.full_host_code == "FULL_HOST_WIRE_LIMIT"   ? "WIRE_LIMIT" :
+                            p.full_host_code == "HOST_MEMORY_PRESSURE_HIGH" ? "HOST_MEMORY_PRESSURE_HIGH" : "CURRENT_RAM_LIMIT";
+         p.limiting_resource = p.primary_reason == "WIRE_LIMIT" ? "WIRE" : "HOST_RAM";
+     } else {
+         p.plan_mode = TOSH_PLAN_MODE_FULL_HOST_DMOE;

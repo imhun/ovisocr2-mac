@@ -1,0 +1,58 @@
+diff --git a/src/llama-tosh-dmoe.cpp b/src/llama-tosh-dmoe.cpp
+index bcbabef62..0209b96f1 100644
+--- a/src/llama-tosh-dmoe.cpp
++++ b/src/llama-tosh-dmoe.cpp
+@@ -709,10 +709,11 @@ struct policy {
+     std::mutex vp_mutex;
+     std::vector<std::vector<std::pair<int32_t, int32_t>>> vplan;
+     std::vector<int> claims;              // slots claimed by bank uploads, not yet seen by the policy
+     uint64_t lent = 0, lent_dropped = 0;
+     std::vector<uint8_t> vmask;
++    std::vector<uint64_t> vmask_sync;    // completed graphs when a layer's mask last changed
+     std::vector<uint8_t> full;           // parts a slot needs: 7, or 5 when gate and up share a bank
+     std::vector<int> prefill_slots;
+     uint64_t vpromotions = 0, vexpired = 0;
+ 
+     struct obs {
+@@ -987,10 +988,17 @@ struct policy {
+                 } else {
+                     pending[key] = 1;
+                 }
+             }
+             claims.clear();
++            // a batch can end with a layer's plan half carried, and decode brings no upload to finish
++            // it: once nothing can still be copying, the mark goes and its slots expire below
++            if (!tosh_dmoe_wide()) {
++                for (int il = 0; il < n_layer; ++il) {
++                    if (vmask[il] != 0 && sync > vmask_sync[il] + 16) vmask[il] = 0;
++                }
++            }
+             for (size_t i = 0; i < prefill_slots.size();) {
+                 const int gs = prefill_slots[i];
+                 slot & sl = slots[gs];
+                 const int il = gs / Q, s = gs % Q;
+                 const size_t key = (size_t) il*n_expert + sl.e;
+@@ -1376,10 +1384,11 @@ static bool dmoe_bank_plan(const void * host, size_t size, tosh_dmoe_bank_plan *
+             }
+             plan->promo_expert = pe.data();
+             plan->promo_slot   = ps.data();
+             plan->n_promo      = (int) pe.size();
+             p.vmask[r.il] |= (uint8_t) (1u << r.which);
++            p.vmask_sync[r.il] = tosh_dmoe_completed_value();
+             if (p.vmask[r.il] == p.full[r.il]) {
+                 if (rows) {
+                     lst.erase(std::remove_if(lst.begin(), lst.end(), [rows](auto & q) { return rows[q.first] > 0; }), lst.end());
+                 } else {
+                     lst.clear();
+@@ -1925,10 +1934,11 @@ static void dmoe_init(std::vector<llama_layer> & layers, const llama_hparams & h
+         pol->verify_every = (long) envf("TOSH_DMOE_VERIFY", 0);
+         pol->defer_wide   = envf("TOSH_DMOE_DEFER_WIDE", 0) != 0;
+         pol->vram_promote = envf("TOSH_DMOE_PREFILL_PROMOTE", 1) != 0;
+         pol->vplan.resize(n_layer);
+         pol->vmask.assign(n_layer, 0);
++        pol->vmask_sync.assign(n_layer, 0);
+         pol->full.assign(n_layer, 7);
+         for (int il = 0; il < n_layer; ++il) {
+             if (layers[il].ffn_gate_exps == nullptr) pol->full[il] = 5;
+         }
+         pol->layers.assign(n_layer, nullptr);

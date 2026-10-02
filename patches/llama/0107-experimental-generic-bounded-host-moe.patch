@@ -1,0 +1,255 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 19371bd2d..9e4d3fa37 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -12,17 +12,24 @@
+ #include "ggml-backend-impl.h"
+ #include "ggml-alloc.h"
+ #include "ggml-impl.h"
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
+ #include "tosh-dmoe.h"
++#include "tosh-hostcache.h"
+ #else
+ static inline bool   tosh_dmoe_compact(void) { return false; }
+ static inline float  tosh_dmoe_token_decay(void) { return 0.0f; }
+ static inline void   tosh_dmoe_set_chunk_rows(const int32_t *, const float *, int) {}
+ static inline void   tosh_dmoe_note_time(int, int64_t) {}
+ static inline void   tosh_dmoe_timeline(int, int, double, double) {}
+ static inline double tosh_dmoe_host_seconds(void) { return 0.0; }
++static inline bool   tosh_hostcache_on(void) { return false; }
++static inline bool   tosh_hostcache_lookup(const void *, int *, int *) { return false; }
++static inline bool   tosh_hostcache_acquire(int, const int32_t *, int, int) { return false; }
++static inline const char * tosh_hostcache_part(int, int, int) { return nullptr; }
++static inline void   tosh_hostcache_release(int, const int32_t *, int) {}
++#define TOSH_HC_PREFILL 3
+ #endif
+ 
+ #include <assert.h>
+ #include <limits.h>
+ #include <stdarg.h>
+@@ -2000,10 +2007,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         }
+ 
+                         prev_ids_tensor = ids_tensor;
+                     }
+ 
++                    // bounded host cache: the bank has no bytes; each used expert comes from the cache,
++                    // pinned until the copies are done
++                    int hc_il = -1, hc_part = -1;
++                    if (tosh_hostcache_on() && tosh_hostcache_lookup(input->data, &hc_il, &hc_part)) {
++                        std::vector<int32_t> pin;
++                        for (int32_t e = 0; e < n_expert; ++e) if (ggml_bitset_get(used_ids.data(), e)) pin.push_back(e);
++                        if (pin.empty()) continue;
++                        GGML_ASSERT(tosh_hostcache_acquire(hc_il, pin.data(), (int) pin.size(), TOSH_HC_PREFILL) && "bounded host cache read failed");
++                        for (int32_t e : pin) {
++                            ggml_backend_tensor_set_async(split_backend, input_cpy, tosh_hostcache_part(hc_il, e, hc_part), (size_t) e*expert_size, expert_size);
++                        }
++                        ggml_backend_synchronize(split_backend);
++                        tosh_hostcache_release(hc_il, pin.data(), (int) pin.size());
++                        continue;
++                    }
++
+                     // group consecutive experts and copy them together
+                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                         const size_t expert_offset = first_id * expert_size;
+                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+                         const size_t padding = std::min<size_t>(expert_size, 512);
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index 081508717..eb12a0451 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -1592,10 +1592,25 @@ static bool ggml_metal_dmoe_bank_upload(ggml_metal_t ctx, struct ggml_tensor * t
+         atexit(ggml_metal_dmoe_pf_report);
+     }
+     if (plan.rows != NULL && ggml_metal_dmoe_compact_upload(ctx, &plan, bid_dst, bid_arena, data)) {
+         return true;
+     }
++    if (tosh_hostcache_on()) {
++        // the bank holds no bytes: without the chunk's routing every expert is taken from the cache
++        static int32_t all_rows[1024];
++        static uint64_t n_all = 0;
++        if (plan.n_expert > 1024) {
++            GGML_ABORT("bounded host cache: a bank upload without routing and more than 1024 experts");
++        }
++        for (int e = 0; e < plan.n_expert; ++e) all_rows[e] = 1;
++        plan.rows = all_rows;
++        if (n_all++ == 0) GGML_LOG_WARN("%s: bounded host cache: a bank upload without routing takes every expert\n", __func__);
++        if (ggml_metal_dmoe_compact_upload(ctx, &plan, bid_dst, bid_arena, data)) {
++            return true;
++        }
++        GGML_ABORT("bounded host cache: a bank upload found no cached path: %s", tosh_hostcache_error() ? tosh_hostcache_error() : "?");
++    }
+ 
+     int stage = -1;
+     size_t offs_src = 0;
+     id<MTLBuffer> buf_src = ggml_metal_device_wrap_host(ctx->dev, data, size, &offs_src);
+     if (buf_src == nil) {
+diff --git a/src/llama-tosh-dmoe.cpp b/src/llama-tosh-dmoe.cpp
+index 83c3eefa5..a9e545b84 100644
+--- a/src/llama-tosh-dmoe.cpp
++++ b/src/llama-tosh-dmoe.cpp
+@@ -290,13 +290,14 @@ struct executor {
+         pinned_il = il;
+         if (!tosh_hostcache_acquire(il, pinned.data(), (int) pinned.size(), kind)) {
+             tosh_dmoe_fail(tosh_hostcache_error());
+             return false;
+         }
++        const size_t up_off = bank->fused ? (size_t) n_ff*bank->gate->nb[1] : 0;
+         for (miss & m : misses) {
+             m.g = tosh_hostcache_part(il, m.e, 0);
+-            m.u = tosh_hostcache_part(il, m.e, 1);
++            m.u = bank->fused ? m.g + up_off : tosh_hostcache_part(il, m.e, 1);
+             m.d = tosh_hostcache_part(il, m.e, 2);
+         }
+         return true;
+     }
+ 
+@@ -769,18 +770,18 @@ struct policy {
+         const int32_t eid = e;
+         const bool hc = tosh_hostcache_on();
+         if (hc && !tosh_hostcache_acquire(il, &eid, 1, TOSH_HC_VERIFY)) {
+             return false;
+         }
+-        int part = 0;
++        int part = -1;
+         for (auto [bank, arena] : { std::pair{ b.gate, dl->arena_gate }, { b.up, dl->arena_up }, { b.down, dl->arena_down } }) {
++            part++;
+             if (bank == nullptr) continue;
+             std::vector<uint8_t> got(arena->nb[2]);
+             ggml_backend_tensor_get(arena, got.data(), (size_t) s*arena->nb[2], got.size());
+             const char * src = hc ? tosh_hostcache_part(il, e, part) : (const char *) bank->data + (size_t) e*bank->nb[2];
+             ok = ok && memcmp(got.data(), src, got.size()) == 0;
+-            part++;
+         }
+         if (hc) tosh_hostcache_release(il, &eid, 1);
+         return ok;
+     }
+ 
+@@ -1054,13 +1055,15 @@ struct policy {
+                 const int32_t eid = e;
+                 const bool hc = tosh_hostcache_on();
+                 if (hc && !tosh_hostcache_acquire(il, &eid, 1, TOSH_HC_PROMOTE)) {
+                     tosh_dmoe_fail(tosh_hostcache_error());
+                 }
++                int part = -1;
+                 for (auto [bank, arena] : { std::pair{ b.gate, dl->arena_gate }, { b.up, dl->arena_up }, { b.down, dl->arena_down } }) {
++                    part++;
+                     if (bank == nullptr) continue;
+-                    const char * src = hc ? tosh_hostcache_part(il, e, n_copies) : (const char *) bank->data + (size_t) e*bank->nb[2];
++                    const char * src = hc ? tosh_hostcache_part(il, e, part) : (const char *) bank->data + (size_t) e*bank->nb[2];
+                     copies[n_copies++] = { arena, (size_t) s*arena->nb[2], src, arena->nb[2] };
+                 }
+                 sl.e = e; sl.gen++; sl.issued = clk::now();
+                 const clk::time_point tu = clk::now();
+                 sl.ticket = up->upload(up->ctx, copies, n_copies);
+@@ -1464,38 +1467,34 @@ static void dmoe_lock_bank(const std::vector<llama_layer> & layers) {
+ static void dmoe_start_hostcache(const std::vector<llama_layer> & layers, const llama_hparams & hparams) {
+     static bool started = false;
+     if (started) {
+         return;
+     }
+-    if (hparams.n_expert != 256 || hparams.n_expert_used() != 8) {
+-        throw std::runtime_error("the bounded host cache prototype runs Qwen3.6-35B-A3B only");
+-    }
+     const char * ob = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
+     if (ob == nullptr || atoi(ob) > TOSH_DMOE_MAX_TOKENS + 1) {
+         throw std::runtime_error(format("the bounded host cache needs GGML_OP_OFFLOAD_MIN_BATCH=%d: smaller batches would compute experts from the bank on the CPU backend", TOSH_DMOE_MAX_TOKENS + 1));
+     }
+     int n_moe = 0;
+     for (int il = 0; il < (int) layers.size(); ++il) {
+         const llama_layer & L = layers[il];
+-        if (L.ffn_gate_up_exps || L.ffn_gate_exps_b || L.ffn_up_exps_b || L.ffn_down_exps_b) {
+-            throw std::runtime_error("the bounded host cache prototype runs Qwen3.6-35B-A3B only");
+-        }
+-        if (!L.ffn_gate_exps) continue;
++        if (!dmoe_gate(L)) continue;
++        // parts keep fixed places: 0 gate (or fused gate/up), 1 up, 2 down; biases and scales stay loaded
+         int part = 0;
+-        for (const ggml_tensor * t : { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps }) {
+-            if (!tosh_hostcache_bind(il, part++, t->data, t->nb[2], (int) hparams.n_expert)) {
++        for (const ggml_tensor * t : { (const ggml_tensor *) dmoe_gate(L), (const ggml_tensor *) L.ffn_up_exps, (const ggml_tensor *) L.ffn_down_exps }) {
++            if (t != nullptr && !tosh_hostcache_bind(il, part, t->data, t->nb[2], (int) hparams.n_expert)) {
+                 throw std::runtime_error(tosh_hostcache_error());
+             }
++            part++;
+         }
+         n_moe++;
+     }
+     if (n_moe == 0 || !tosh_hostcache_start((int) layers.size(), (int) hparams.n_expert)) {
+         throw std::runtime_error(tosh_hostcache_error() ? tosh_hostcache_error() : "no expert bank");
+     }
+     const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+     for (const llama_layer & L : layers) {
+-        for (const ggml_tensor * t : { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps }) {
++        for (const ggml_tensor * t : { (const ggml_tensor *) dmoe_gate(L), (const ggml_tensor *) L.ffn_up_exps, (const ggml_tensor *) L.ffn_down_exps }) {
+             if (t == nullptr) continue;
+             const uintptr_t a = ((uintptr_t) t->data + page - 1) & ~(uintptr_t) (page - 1);
+             const uintptr_t b = ((uintptr_t) t->data + ggml_nbytes(t)) & ~(uintptr_t) (page - 1);
+             if (b > a) mprotect((void *) a, b - a, PROT_NONE);
+         }
+diff --git a/tosh-moe/tosh-hostcache.cpp b/tosh-moe/tosh-hostcache.cpp
+index 4fdb4ce2e..f207be13e 100644
+--- a/tosh-moe/tosh-hostcache.cpp
++++ b/tosh-moe/tosh-hostcache.cpp
+@@ -199,11 +199,12 @@ bool tosh_hostcache_on(void) {
+ }
+ 
+ bool tosh_hostcache_is_bank_name(const char * name) {
+     const char * p = strstr(name, ".ffn_");
+     if (p == nullptr) return false;
+-    return strcmp(p, ".ffn_gate_exps.weight") == 0 || strcmp(p, ".ffn_up_exps.weight") == 0 || strcmp(p, ".ffn_down_exps.weight") == 0;
++    return strcmp(p, ".ffn_gate_exps.weight") == 0 || strcmp(p, ".ffn_up_exps.weight") == 0 || strcmp(p, ".ffn_down_exps.weight") == 0 ||
++           strcmp(p, ".ffn_gate_up_exps.weight") == 0;
+ }
+ 
+ void tosh_hostcache_note_file_tensor(const void * data, size_t nbytes, int fd, uint64_t file_off) {
+     std::lock_guard<std::mutex> lock(g.m);
+     g.noted[data] = { nbytes, file_off };
+@@ -260,14 +261,19 @@ bool tosh_hostcache_start(int n_layer, int n_expert) {
+         for (int k = 0; k < (int) g.pools.size(); ++k) if (g.pools[k].slot_bytes == layer_bytes[il]) pi = k;
+         if (pi < 0) { pi = (int) g.pools.size(); g.pools.emplace_back(); g.pools.back().slot_bytes = layer_bytes[il]; }
+         g.pool_of_layer[il] = pi;
+     }
+     if (g.pools.empty()) { g.error = "no expert bank to cache"; return false; }
++    // every pool holds at least one layer's full expert set, since a prefill chunk can pin them all;
++    // the rest of the budget is shared in proportion to each size class
++    size_t floor_bytes = 0;
++    for (auto & pl : g.pools) floor_bytes += pl.slot_bytes*(size_t) n_expert;
++    if (floor_bytes > g.cap_bytes) { g.error = "the expert cache is smaller than one layer's experts per size class"; return false; }
+     for (auto & pl : g.pools) {
+         size_t class_bytes = 0;
+         for (int il = 0; il < n_layer; ++il) if (g.pool_of_layer[il] >= 0 && g.pools[g.pool_of_layer[il]].slot_bytes == pl.slot_bytes) class_bytes += pl.slot_bytes*(size_t) n_expert;
+-        const size_t share = (size_t) ((double) g.cap_bytes*class_bytes/bank_bytes);
++        const size_t share = (size_t) ((double) (g.cap_bytes - floor_bytes)*class_bytes/bank_bytes) + pl.slot_bytes*(size_t) n_expert;
+         pl.n = (int) std::min(share/pl.slot_bytes, class_bytes/pl.slot_bytes);
+         pl.first = g.n_slots;
+         g.n_slots += pl.n;
+         pl.bytes = (size_t) pl.n*pl.slot_bytes;
+         void * p = mmap(nullptr, std::max<size_t>(pl.bytes, 1), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+@@ -354,10 +360,11 @@ static void prewarm(int n_io) {
+         std::vector<int> order = slots;
+         std::sort(order.begin(), order.end(), [](int a, int b) { return g.key_of[a] < g.key_of[b]; });
+         for (int part = 0; part < 3; ++part) {
+             for (size_t i = 0; i < order.size();) {
+                 const int k0 = g.key_of[order[i]];
++                if (g.parts[k0 / g.n_expert*3 + part].bytes == 0) { i++; continue; }   // no such part (fused gate/up)
+                 job j{ k0 / g.n_expert, part, k0 % g.n_expert, { order[i] } };
+                 size_t k = i + 1;
+                 // a run stays inside one layer's tensor
+                 while (k < order.size() && g.key_of[order[k]] == k0 + (int) (k - i) && g.key_of[order[k]] / g.n_expert == j.il &&
+                        j.s.size() < 64) j.s.push_back(order[k++]);
+@@ -371,11 +378,13 @@ static void prewarm(int n_io) {
+             return oa < ob;
+         });
+     } else {
+         for (int s : slots) {
+             const int k = g.key_of[s];
+-            for (int part = 0; part < 3; ++part) jobs.push_back({ k / g.n_expert, part, k % g.n_expert, { s } });
++            for (int part = 0; part < 3; ++part) {
++                if (g.parts[k / g.n_expert*3 + part].bytes > 0) jobs.push_back({ k / g.n_expert, part, k % g.n_expert, { s } });
++            }
+         }
+     }
+     std::atomic<size_t> next{0};
+     std::atomic<uint64_t> n_reads{0};
+     std::vector<std::thread> th;

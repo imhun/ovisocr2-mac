@@ -1,0 +1,412 @@
+diff --git a/common/tosh-plan.cpp b/common/tosh-plan.cpp
+index 8f0730faa..9859530ed 100644
+--- a/common/tosh-plan.cpp
++++ b/common/tosh-plan.cpp
+@@ -671,11 +671,12 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+         } else if (p.host_pressure == "CRITICAL") {
+             p.bounded_code = "HOST_MEMORY_PRESSURE_HIGH";
+         } else {
+             // under elevated pressure the cache takes half of what is left
+             const double budget = p.effective_mib*(p.host_pressure == "ELEVATED" ? 0.5 : 1.0) - host_engine - staging_mib;
+-            bounded_warm = std::min({ mi.bank_mib, budget, p.lockable_mib });
++            // the weights kept in RAM and the staging are locked too
++            bounded_warm = std::min({ mi.bank_mib, budget, p.lockable_mib - host_engine - staging_mib });
+             p.bounded_code = bounded_warm >= mi.warm_floor_mib ? "BOUNDED_HOST_SELECTED" :
+                              p.lockable_mib < mi.warm_floor_mib ? "HOST_MEMORY_LOCK_LIMIT" :
+                              bounded_warm > 0 ? "STRUCTURAL_WARM_TOO_SMALL" : "BOUNDED_HOST_CURRENT_RAM_TOO_LOW";
+             // the cache refuses to start below one layer's experts per size, a prefill chunk can pin them all
+             if (bounded_warm < mi.warm_floor_mib) {
+@@ -796,11 +797,16 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+     };
+ 
+     const tosh_plan_candidate * sel = nullptr;
+     // VRAM kept free after every known allocation, for the desktop and other apps; the plan
+     // already counts weights, KV, compute, prefill slots and the driver margin
+-    const double reserve_auto = std::clamp(RESERVE_FRACTION*p.vram_total_mib, RESERVE_MIN_MIB, RESERVE_MAX_MIB);
++    // an MTP head adds its own context and buffers after the plan; past the reserve the driver pages
++    // GPU memory into wired RAM, which slows every token and can use up the host
++    const auto & spec_types = params.speculative.types;
++    const bool mtp = std::find(spec_types.begin(), spec_types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != spec_types.end();
++    const double reserve_auto = std::clamp(RESERVE_FRACTION*p.vram_total_mib, RESERVE_MIN_MIB, RESERVE_MAX_MIB) +
++                                (mtp ? env_mib("TOSH_AUTO_MTP_RESERVE_MIB", 768.0) : 0.0);
+     const double reserve_pref = env_mib("TOSH_AUTO_RESERVE_MIB", reserve_auto);
+     const double reserves[2] = { reserve_pref, env_mib("TOSH_AUTO_MIN_RESERVE_MIB", std::max(512.0, reserve_pref - 256.0)) };
+     for (double R : reserves) {
+         evaluate(R);
+         const tosh_plan_candidate * f16 = find("full_gpu", kvs[0], 0);
+@@ -1004,10 +1010,20 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+         setenv("TOSH_DMOE_MIN_ARENA_MIB", string_format("%.0f", p.min_arena_mib).c_str(), 1);
+         setenv("TOSH_DMOE_RARE_ROWS", "auto", 0);
+         setenv("TOSH_DMOE_RARE_TAIL", "0", 0);
+         setenv("GGML_SCHED_PREFETCH_EXPERTS", "1", 0);
+         setenv("GGML_CPU_NO_REPACK", "1", 0);
++        // the host executor computes the missed experts on every core; the backend's own threads find little
++        // CPU work here (verify windows and prompts included) and only compete with it for the cores
++        const int cpu_threads = (int) env_mib("TOSH_DMOE_LLAMA_THREADS", 2);
++        if (cpu_threads > 0) {
++            for (auto * cp : { &params.cpuparams, &params.cpuparams_batch }) {
++                if (cp->n_threads <= 0 || cp->n_threads > cpu_threads) {
++                    cp->n_threads = cpu_threads;
++                }
++            }
++        }
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
+         tosh_dmoe_enable();
+ #endif
+     } else if (p.mode == "legacy_offload") {
+         // the host share is sized as anonymous memory, as with the expert bank
+diff --git a/src/llama-tosh-dmoe.cpp b/src/llama-tosh-dmoe.cpp
+index 920572b23..f89c36daa 100644
+--- a/src/llama-tosh-dmoe.cpp
++++ b/src/llama-tosh-dmoe.cpp
+@@ -117,22 +117,24 @@ struct executor {
+     size_t act_q_row = 0;
+     size_t h_q_row   = 0;
+ 
+     // current job
+     std::vector<miss> misses;
++    std::vector<int>  grp;   // start of each run of misses on one expert, then the end
+     const host_bank * bank = nullptr;
+     const float * act = nullptr;
+     float * out = nullptr;
+     int n_used = 0;
+     bool wide = false;                 // out holds one row per miss instead of one per router position
+ 
+-    std::atomic<int>      next1{0};
+-    std::atomic<int>      next2{0};
+-    std::atomic<uint64_t> gen{0};
+-    std::atomic<int>      arrived{0};
+-    std::atomic<uint64_t> barrier_gen{0};
+-    std::atomic<bool>     stop{false};
++    // one cache line each: every chunk claim would otherwise invalidate the line the barrier spins on
++    alignas(64) std::atomic<int>      next1{0};
++    alignas(64) std::atomic<int>      next2{0};
++    alignas(64) std::atomic<uint64_t> gen{0};
++    alignas(64) std::atomic<int>      arrived{0};
++    alignas(64) std::atomic<uint64_t> barrier_gen{0};
++    alignas(64) std::atomic<bool>     stop{false};
+ 
+     // helpers spin while jobs come every few hundred microseconds (decode) and sleep otherwise
+     std::mutex              work_mutex;
+     std::condition_variable work_cv;
+     std::atomic<int>        sleepers{0};
+@@ -159,19 +161,32 @@ struct executor {
+     int32_t obs_slots[TOSH_DMOE_MAX_TOKENS*256];
+     int     obs_n = 0;
+     std::vector<std::atomic<uint32_t>> hits_by_tick, routed_by_tick;
+ 
+     // stats
+-    std::atomic<uint64_t> n_jobs{0}, n_routed{0}, n_miss{0};
++    alignas(64) std::atomic<uint64_t> n_jobs{0};
++    std::atomic<uint64_t> n_routed{0}, n_miss{0};
+     std::atomic<uint64_t> n_wide{0}, n_wide_miss{0}, n_wide_experts{0}, us_wide{0};
+     std::atomic<uint64_t> us_job{0}, us_quant{0}, us_p1{0}, us_p2{0};
+     std::vector<std::atomic<uint64_t>> miss_by_layer;
+     std::vector<std::atomic<uint64_t>> routed_by_layer;
+ 
+     static constexpr int rows1 = 16;
+     static constexpr int rows2 = 64;
+ 
++    // misses sorted by expert; a run is capped so a wide batch still spreads over the threads
++    void build_groups() {
++        static constexpr int max_run = 8;
++        grp.clear();
++        for (int i = 0; i < (int) misses.size(); ++i) {
++            if (i == 0 || misses[i].e != misses[i - 1].e || i - grp.back() >= max_run) {
++                grp.push_back(i);
++            }
++        }
++        grp.push_back((int) misses.size());
++    }
++
+     void barrier() {
+         const uint64_t g = barrier_gen.load(std::memory_order_acquire);
+         if (arrived.fetch_add(1, std::memory_order_acq_rel) + 1 == n_threads) {
+             arrived.store(0, std::memory_order_relaxed);
+             barrier_gen.store(g + 1, std::memory_order_release);
+@@ -189,26 +204,29 @@ struct executor {
+         const ggml_tensor * up_t = bank->fused ? bank->gate : bank->up;
+         const size_t up_off = bank->fused ? (size_t) n_ff*bank->gate->nb[1] : 0;
+         const auto * tt_down = ggml_get_type_traits_cpu(bank->down->type);
+ 
+         const int n_miss = (int) misses.size();
++        const int n_grp  = (int) grp.size() - 1;
+         const int c1 = n_ff/rows1;
+         const clk::time_point t1 = clk::now();
+-        for (int c; (c = next1.fetch_add(1, std::memory_order_relaxed)) < n_miss*c1; ) {
+-            const miss & m = misses[c/c1];
++        // each weight row is read once per run of misses on its expert and applied to all of them, and
++        // unpacked once for up to four of them where the type has a multi-row dot
++        const auto mg = ggml_cpu_get_vec_dot_multi(bank->gate->type);
++        const auto mu = ggml_cpu_get_vec_dot_multi(up_t->type);
++        const auto md = ggml_cpu_get_vec_dot_multi(bank->down->type);
++        for (int c; (c = next1.fetch_add(1, std::memory_order_relaxed)) < n_grp*c1; ) {
++            const int i0 = grp[c/c1], i1 = grp[c/c1 + 1];
++            const miss & m = misses[i0];
+             const int r0 = (c % c1)*rows1;
+             const char * g = m.g ? m.g : (const char *) bank->gate->data + (size_t) m.e*bank->gate->nb[2];
+             const char * u = m.u ? m.u : (const char *) up_t->data + (size_t) m.e*up_t->nb[2] + up_off;
+-            const void * a = act_q.data() + (size_t) m.t*act_q_row;
+-            float * hr = h.data() + (size_t) (c/c1)*n_ff;
+             const float * gb = bank->gate_b.empty() ? nullptr : bank->gate_b.data() + (size_t) m.e*n_ff;
+             const float * ub = bank->up_b.empty()   ? nullptr : bank->up_b.data()   + (size_t) m.e*n_ff;
+             const int act = bank->act.load(std::memory_order_relaxed);
+-            for (int r = r0; r < r0 + rows1; ++r) {
+-                float sg, su;
+-                tt_gate->vec_dot(n_embd, &sg, 0, g + (size_t) r*bank->gate->nb[1], 0, a, 0, 1);
+-                tt_up  ->vec_dot(n_embd, &su, 0, u + (size_t) r*up_t->nb[1],       0, a, 0, 1);
++            auto finish = [&](int i, int r, float sg, float su) {
++                float * hr = h.data() + (size_t) i*n_ff;
+                 if (gb) sg += gb[r];
+                 if (ub) su += ub[r];
+                 if (act == 1) {
+                     // same form as ggml_swiglu_oai
+                     const float x = std::min(sg, bank->limit);
+@@ -218,10 +236,34 @@ struct executor {
+                     // the tanh form ggml_geglu uses
+                     hr[r] = 0.5f*sg*(1.0f + tanhf(0.7978845608f*sg*(1.0f + 0.044715f*sg*sg)))*su;
+                 } else {
+                     hr[r] = sg/(1.0f + expf(-sg))*su;
+                 }
++            };
++            for (int r = r0; r < r0 + rows1; ++r) {
++                const char * gr = g + (size_t) r*bank->gate->nb[1];
++                const char * ur = u + (size_t) r*up_t->nb[1];
++                int i = i0;
++                if (mg && mu) {
++                    while (i1 - i >= 2) {
++                        const int k = std::min(4, i1 - i);
++                        const void * av[4];
++                        for (int t = 0; t < k; ++t) av[t] = act_q.data() + (size_t) misses[i + t].t*act_q_row;
++                        float sg[4], su[4];
++                        mg(n_embd, k, sg, gr, av);
++                        mu(n_embd, k, su, ur, av);
++                        for (int t = 0; t < k; ++t) finish(i + t, r, sg[t], su[t]);
++                        i += k;
++                    }
++                }
++                for (; i < i1; ++i) {
++                    const void * a = act_q.data() + (size_t) misses[i].t*act_q_row;
++                    float sg, su;
++                    tt_gate->vec_dot(n_embd, &sg, 0, gr, 0, a, 0, 1);
++                    tt_up  ->vec_dot(n_embd, &su, 0, ur, 0, a, 0, 1);
++                    finish(i, r, sg, su);
++                }
+             }
+         }
+         barrier();
+         if (tid == 0) {
+             us_p1 += (uint64_t) us_since(t1);
+@@ -232,18 +274,36 @@ struct executor {
+             }
+         }
+         barrier();
+         const clk::time_point t2 = clk::now();
+         const int c2 = n_embd/rows2;
+-        for (int c; (c = next2.fetch_add(1, std::memory_order_relaxed)) < n_miss*c2; ) {
+-            const miss & m = misses[c/c2];
++        for (int c; (c = next2.fetch_add(1, std::memory_order_relaxed)) < n_grp*c2; ) {
++            const int i0 = grp[c/c2], i1 = grp[c/c2 + 1];
+             const int r0 = (c % c2)*rows2;
+-            const char * d = m.d ? m.d : (const char *) bank->down->data + (size_t) m.e*bank->down->nb[2];
+-            const void * hq = h_q.data() + (size_t) (c/c2)*h_q_row;
+-            float * o = out + (wide ? (size_t) (c/c2) : (size_t) m.t*n_used + m.j)*n_embd;
++            const miss & m0 = misses[i0];
++            const char * d = m0.d ? m0.d : (const char *) bank->down->data + (size_t) m0.e*bank->down->nb[2];
++            auto out_row = [&](int i) {
++                const miss & m = misses[i];
++                return out + (wide ? (size_t) i : (size_t) m.t*n_used + m.j)*n_embd;
++            };
+             for (int r = r0; r < r0 + rows2; ++r) {
+-                tt_down->vec_dot(n_ff, o + r, 0, d + (size_t) r*bank->down->nb[1], 0, hq, 0, 1);
++                const char * dr = d + (size_t) r*bank->down->nb[1];
++                int i = i0;
++                if (md) {
++                    while (i1 - i >= 2) {
++                        const int k = std::min(4, i1 - i);
++                        const void * hv[4];
++                        for (int t = 0; t < k; ++t) hv[t] = h_q.data() + (size_t) (i + t)*h_q_row;
++                        float o4[4];
++                        md(n_ff, k, o4, dr, hv);
++                        for (int t = 0; t < k; ++t) out_row(i + t)[r] = o4[t];
++                        i += k;
++                    }
++                }
++                for (; i < i1; ++i) {
++                    tt_down->vec_dot(n_ff, out_row(i) + r, 0, dr, 0, h_q.data() + (size_t) i*h_q_row, 0, 1);
++                }
+             }
+         }
+         barrier();
+         if (tid == 0) {
+             us_p2 += (uint64_t) us_since(t2);
+@@ -340,10 +400,11 @@ struct executor {
+         if ((int) misses.size() > TOSH_DMOE_WIDE_MAX_ROWS) {
+             tosh_dmoe_fail("a wide layer sent more host rows than the stage holds");
+             return false;
+         }
+         std::stable_sort(misses.begin(), misses.end(), [](const miss & a, const miss & b) { return a.e < b.e; });
++        build_groups();
+         int n_exp = 0;
+         for (size_t i = 0; i < misses.size(); ++i) {
+             map[misses[i].t*nu + misses[i].j] = (int32_t) i;
+             n_exp += i == 0 || misses[i].e != misses[i - 1].e;
+         }
+@@ -428,10 +489,15 @@ struct executor {
+                     misses.push_back({ t, j, ids[k] });
+                     tok_used[t] = true;
+                 }
+             }
+         }
++        // a verify window often routes two tokens to one expert: read its rows once for both
++        if (jb.n_tokens > 1) {
++            std::stable_sort(misses.begin(), misses.end(), [](const miss & a, const miss & b) { return a.e < b.e; });
++        }
++        build_groups();
+ 
+         const uint64_t routed = (uint64_t) jb.n_tokens*n_used;
+         n_routed += routed;
+         n_miss   += misses.size();
+         routed_by_layer[il] += routed;
+@@ -1450,14 +1516,15 @@ static void dmoe_lock_bank(const std::vector<llama_layer> & layers) {
+     for (const llama_layer & L : layers) {
+         for (const ggml_tensor * t : { (const ggml_tensor *) dmoe_gate(L), (const ggml_tensor *) L.ffn_up_exps, (const ggml_tensor *) L.ffn_down_exps }) {
+             if (t == nullptr || t->data == nullptr) continue;
+             const uintptr_t a = (uintptr_t) t->data & ~(uintptr_t) (page - 1);
+             const uintptr_t b = ((uintptr_t) t->data + ggml_nbytes(t) + page - 1) & ~(uintptr_t) (page - 1);
+-            if (test_fail || mlock((void *) a, b - a) != 0) {
+-                const int e = test_fail ? EAGAIN : errno;
+-                throw std::runtime_error(format("DMOE_HOST_BANK_NOT_LOCKABLE: mlock of %.0f MiB of the expert bank failed after %.0f MiB (%s)",
+-                                                (b - a)/1048576.0, bytes/1048576.0, strerror(e)));
++            char err[256];
++            if (test_fail || !tosh_mlock_paced((void *) a, b - a, err, sizeof(err))) {
++                throw std::runtime_error(test_fail ? format("DMOE_HOST_BANK_NOT_LOCKABLE: mlock of %.0f MiB of the expert bank failed after %.0f MiB (%s)",
++                                                           (b - a)/1048576.0, bytes/1048576.0, strerror(EAGAIN))
++                                                   : format("%s, expert bank at %.0f MiB", err, bytes/1048576.0));
+             }
+             bytes += b - a;
+         }
+     }
+     locked = true;
+diff --git a/tosh-moe/tosh-hostcache.cpp b/tosh-moe/tosh-hostcache.cpp
+index b7e64a355..054c2df64 100644
+--- a/tosh-moe/tosh-hostcache.cpp
++++ b/tosh-moe/tosh-hostcache.cpp
+@@ -18,10 +18,13 @@
+ #include <fcntl.h>
+ #include <pthread.h>
+ #include <sys/mman.h>
+ #include <sys/uio.h>
+ #include <sys/param.h>
++#ifdef __APPLE__
++#include <sys/sysctl.h>
++#endif
+ #include <unistd.h>
+ 
+ namespace {
+ 
+ enum slot_state : uint8_t { EMPTY, LOADING, RESIDENT };
+@@ -145,10 +148,44 @@ cache g;
+ 
+ double now_us() {
+     return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count();
+ }
+ 
++// Wired pages cannot be compressed or paged out: locking faster than the system frees memory
++// evicts the code pages of every other process, and a desktop stalls until the watchdog reboots it.
++bool mlock_paced(void * addr, size_t bytes, char * err, size_t err_len) {
++    static const size_t step    = (size_t) 256 << 20;
++    static const double wait_us = 30e6;
++    char * base = (char *) addr;
++    for (size_t o = 0; o < bytes; o += step) {
++#ifdef __APPLE__
++        const double t0 = now_us();
++        for (;;) {
++            int lvl = 1; size_t len = sizeof(lvl);
++            if (sysctlbyname("kern.memorystatus_vm_pressure_level", &lvl, &len, nullptr, 0) != 0 || lvl <= 1) {
++                break;
++            }
++            if (lvl >= 4 || now_us() - t0 > wait_us) {
++                snprintf(err, err_len, "DMOE_HOST_MEMORY_PRESSURE: the system reported %s memory pressure after %.0f of %.0f MiB were locked",
++                         lvl >= 4 ? "critical" : "sustained", o/1048576.0, bytes/1048576.0);
++                munlock(base, o);
++                return false;
++            }
++            std::this_thread::sleep_for(std::chrono::milliseconds(100));
++        }
++#endif
++        if (getenv("TOSH_DMOE_TEST_MLOCK_FAIL") != nullptr || mlock(base + o, std::min(step, bytes - o)) != 0) {
++            const int e = getenv("TOSH_DMOE_TEST_MLOCK_FAIL") != nullptr ? EAGAIN : errno;
++            snprintf(err, err_len, "DMOE_HOST_BANK_NOT_LOCKABLE: mlock failed after %.0f of %.0f MiB (%s)",
++                     o/1048576.0, bytes/1048576.0, strerror(e));
++            munlock(base, o);
++            return false;
++        }
++    }
++    return true;
++}
++
+ void reader_main() {
+ #ifdef __APPLE__
+     // the executor's threads run at this class and would otherwise starve the reads they wait on
+     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+ #endif
+@@ -356,19 +393,15 @@ bool tosh_hostcache_start(int n_layer, int n_expert) {
+     // locking zero-fills every page; with the warm-up fill on, the pages are filled with experts from
+     // the file while the lock proceeds, and the server waits for the lock before it is ready
+     const bool overlap = getenv("TOSH_DMOE_HOST_WARMUP_FILL_MIB") != nullptr;
+     auto lock_pools = [] {
+         for (auto & pl : g.pools) {
+-            const size_t step = (size_t) 256 << 20;
+-            for (size_t o = 0; o < pl.bytes; o += step) {
+-                // TOSH_DMOE_TEST_MLOCK_FAIL: development check of the failure path
+-                if (getenv("TOSH_DMOE_TEST_MLOCK_FAIL") != nullptr || mlock(pl.base + o, std::min(step, pl.bytes - o)) != 0) {
+-                    const int e = getenv("TOSH_DMOE_TEST_MLOCK_FAIL") != nullptr ? EAGAIN : errno;
+-                    std::lock_guard<std::mutex> lk(g.m);
+-                    if (g.error.empty()) g.error = std::string("DMOE_HOST_BANK_NOT_LOCKABLE: mlock of the expert cache failed: ") + strerror(e);
+-                    return;
+-                }
++            char err[256];
++            if (!mlock_paced(pl.base, pl.bytes, err, sizeof(err))) {
++                std::lock_guard<std::mutex> lk(g.m);
++                if (g.error.empty()) g.error = err;
++                return;
+             }
+         }
+     };
+     lock.unlock();
+     if (overlap) {
+@@ -560,10 +593,14 @@ static void prewarm(int n_io) {
+     fprintf(stderr, "tosh_hostcache: prewarm %zu experts, %.0f MiB from %s in %s order, %llu reads, %.0f ms (%.2f GB/s)\n",
+             slots.size(), bytes/1048576.0, strcmp(src, "seq") == 0 ? "layer order" : "a list", by_offset ? "file" : "list",
+             (unsigned long long) n_reads.load(), g.prewarm_us/1000, bytes/(g.prewarm_us*1e3));
+ }
+ 
++bool tosh_mlock_paced(void * addr, size_t bytes, char * err, size_t err_len) {
++    return mlock_paced(addr, bytes, err, err_len);
++}
++
+ bool tosh_hostcache_acquire(int il, const int32_t * ids, int n, int kind) {
+     const double t0 = now_us();
+     std::unique_lock<std::mutex> lock(g.m);
+     std::vector<int> wait;
+     std::vector<uint8_t> wait_cls;     // 0 own read, 1 another demand, 2 a read-back
+diff --git a/tosh-moe/tosh-hostcache.h b/tosh-moe/tosh-hostcache.h
+index 98d538f04..4c7f74332 100644
+--- a/tosh-moe/tosh-hostcache.h
++++ b/tosh-moe/tosh-hostcache.h
+@@ -32,10 +32,14 @@ void tosh_hostcache_note_fused_tensor(const void * data, size_t nbytes, int fd,
+ // Dynamic MoE init: layer il's part (0 gate, 1 up, 2 down) is the noted tensor at data
+ bool tosh_hostcache_bind(int il, int part, const void * data, size_t part_bytes, int n_expert);
+ // allocates and locks the cache and starts the readers; false with tosh_hostcache_error() set
+ bool tosh_hostcache_start(int n_layer, int n_expert);
+ 
++// locks [addr, addr+bytes) a step at a time, waiting while the system reports memory pressure;
++// false with a message in err (at least 256 bytes) when the lock fails or the pressure stays up
++bool tosh_mlock_paced(void * addr, size_t bytes, char * err, size_t err_len);
++
+ // pins experts ids[0..n) of layer il, reading the missing ones; false after a read failure
+ bool tosh_hostcache_acquire(int il, const int32_t * ids, int n, int kind);
+ const char * tosh_hostcache_part(int il, int e, int part);
+ void tosh_hostcache_release(int il, const int32_t * ids, int n);
+ 

@@ -1,0 +1,6 @@
+# OvisOCR2 推理依赖（Apple Silicon / NVIDIA 上使用）
+# 注意：Intel Mac 装不了 torch>=2.5，详见 README.md
+torch>=2.5
+transformers>=5.0
+pillow
+numpy<2

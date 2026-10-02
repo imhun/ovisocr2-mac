@@ -1,0 +1,14 @@
+# Python 虚拟环境与字节码
+.venv/
+__pycache__/
+*.py[cod]
+
+# 模型权重（700MB，本地用 scripts/fetch_gguf.sh 下载）
+models/
+
+# 工作目录：llama.cpp 源码与构建、测试产物、页面图片
+# 注意 patches/ 在仓库根目录，不受这条影响
+tmp/
+
+# macOS
+.DS_Store

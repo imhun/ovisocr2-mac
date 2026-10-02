@@ -1,0 +1,24 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 0fb45b20d..d9efbf196 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -3491,16 +3491,19 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
+                                    size:size];
+ 
+                 [encoder endEncoding];
+             }
+ 
+             [cmd_buf commit];
+             [cmd_buf waitUntilCompleted];
+ 
++            // the wrap is owned here too; the write path already releases its own
++            [buf_dst release];
++
+             if (t0) {
+                 tosh_prof_add(TOSH_PROF_D2H_DIRECT, size, t0);
+             }
+ 
+             return;
+         }
+ 
+         // newBufferWithBytesNoCopy requires page-aligned data, and some drivers cap the size of

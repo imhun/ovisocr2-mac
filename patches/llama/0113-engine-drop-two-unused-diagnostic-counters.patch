@@ -1,0 +1,30 @@
+diff --git a/src/llama-tosh-dmoe.cpp b/src/llama-tosh-dmoe.cpp
+index 320561905..920572b23 100644
+--- a/src/llama-tosh-dmoe.cpp
++++ b/src/llama-tosh-dmoe.cpp
+@@ -1189,8 +1189,8 @@ struct policy {
+         fprintf(stderr, "tosh_dmoe: slots %d of %d resident | evicted lifetime mean %.1f median %u graphs, uses per evicted residency %.1f\n",
+                 used, (int) slots.size(), lifetime_n ? (double) lifetime_sum/lifetime_n : 0.0,
+                 lifetimes.empty() ? 0u : lifetimes[lifetimes.size()/2], lifetime_n ? (double) uses_sum/lifetime_n : 0.0);
+-        uint64_t live_uses = 0; int live = 0;
+-        for (const slot & s : slots) if (s.state == RESIDENT) { live_uses += s.uses; live++; }
++        uint64_t live_uses = 0;
++        for (const slot & s : slots) if (s.state == RESIDENT) live_uses += s.uses;
+         fprintf(stderr, "tosh_dmoe: uses per promotion (evicted + live) %.1f\n",
+                 promotions ? (double) (uses_sum + live_uses)/promotions : 0.0);
+         fprintf(stderr, "tosh_dmoe: policy thread per graph %.1f us (drain %.1f, decide %.1f incl. upload calls %.1f, publish %.1f), %llu publishes, %llu cycles\n",
+diff --git a/tosh-moe/tosh-hostcache.cpp b/tosh-moe/tosh-hostcache.cpp
+index c7e995d66..b7e64a355 100644
+--- a/tosh-moe/tosh-hostcache.cpp
++++ b/tosh-moe/tosh-hostcache.cpp
+@@ -754,8 +754,8 @@ bool tosh_hostcache_warmup_done(void) {
+     std::lock_guard<std::mutex> lock(g.m);
+     g.ready = true;
+     g.t_ready = now_us();
+-    uint64_t cold = 0, hits = 0;
+-    for (int k = 0; k < TOSH_HC_KINDS; ++k) { cold += g.cold[k]; hits += g.hit[k]; }
++    uint64_t hits = 0;
++    for (int k = 0; k < TOSH_HC_KINDS; ++k) hits += g.hit[k];
+     if (!g.error.empty()) fprintf(stderr, "tosh_hostcache: %s\n", g.error.c_str());
+     fprintf(stderr, "tosh_hostcache: ready %.0f ms after the cache started | resident %.0f MiB (%.1f%% of %.0f locked) | warm-up read %llu experts (%.0f MiB), hits %llu | fill %llu experts (%.0f MiB) so far\n",
+             (g.t_ready - g.t_start)/1000, g.resident_bytes/1048576.0, 100.0*g.resident_bytes/std::max<size_t>(1, g.locked_bytes), g.locked_bytes/1048576.0,

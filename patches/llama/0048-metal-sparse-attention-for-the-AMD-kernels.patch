@@ -1,0 +1,279 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index ed84f2843..4de2df086 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -472,18 +472,18 @@ typedef struct {
+     float    m1;
+     int32_t  n_head_log2;
+     float    logit_softcap;
+     int32_t  n_kv_max_padded;
+     int32_t  has_sinks; // read by the AMD kernels; upstream uses a function constant
+     int32_t  has_mask;  // 0 for bidirectional attention (vision towers), which has no mask
+ } ggml_metal_kargs_flash_attn_ext_vec;
+ 
+-// Their own copy of the upstream vec args: a field added there changes the constant buffer
+-// layout, and with it the code emitted for these kernels.
++// the AMD kernels take their own copy: a field added to the upstream vec struct changes the
++// constant buffer layout and with it the code the Metal compiler emits for them
+ typedef struct {
+     int32_t  ne01;
+     int32_t  ne02;
+     int32_t  ne03;
+     uint64_t nb01;
+     uint64_t nb02;
+     uint64_t nb03;
+     int32_t  ne11;
+@@ -509,16 +509,17 @@ typedef struct {
+     float    scale;
+     float    max_bias;
+     float    m0;
+     float    m1;
+     int32_t  n_head_log2;
+     float    logit_softcap;
+     int32_t  has_sinks; // read by the AMD kernels; upstream uses a function constant
+     int32_t  has_mask;  // 0 for bidirectional attention (vision towers), which has no mask
++    int32_t  n_kv_max_padded; // sparse: length of the per-row index list
+ } ggml_metal_kargs_flash_attn_ext_amd;
+ 
+ typedef struct {
+     int32_t  ne30;
+     int32_t  ne31;
+     int32_t  ne32;
+     int32_t  ne33;
+     uint64_t nb31;
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index d059614b1..1e82cb185 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -4158,16 +4158,22 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+                      (int) ne00, (int) ne20, ks, vs, props_dev->simd_width == 64 ? "_w64" : "");
+         }
+     }
+     // wave32 rides on simdgroup_reduction; wave64 uses the _w64 instantiations and
+     // is gated by wave64_decode (simdgroup_reduction is forced off there).
+     const bool fa_amd_width_ok = props_dev->simd_width == 32
+         ? props_dev->has_simdgroup_reduction
+         : props_dev->wave64_decode;
++    // sparse attention (QSA / DeepSeek-V4): the mask already carries the selection, the
++    // index kernel compacts it and the vec kernel walks the list instead of the whole cache
++    const int amd_n_kv_max = ggml_metal_op_flash_attn_ext_n_kv_max_sparse(op);
++    const bool amd_sparse  = amd_n_kv_max > 0 && ne01 == 1;
++    const int amd_n_kv_pad = amd_sparse ? GGML_PAD(amd_n_kv_max, OP_FLASH_ATTN_EXT_VEC_NCPSG) : 0;
++
+     if (getenv("TOSH_FA_AMD") != NULL && fa_amd_pipeline[0] != '\0' &&
+         !props_dev->has_simdgroup_mm && fa_amd_width_ok &&
+         !has_bias && !has_scap) {
+ 
+         ggml_metal_kargs_flash_attn_ext_amd args = {
+             /*.ne01          =*/ ne01,
+             /*.ne02          =*/ ne02,
+             /*.ne03          =*/ ne03,
+@@ -4197,16 +4203,17 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+             /*.scale         =*/ scale,
+             /*.max_bias      =*/ max_bias,
+             /*.m0            =*/ m0,
+             /*.m1            =*/ m1,
+             /*.n_head_log2   =*/ n_head_log2,
+             /*.logit_softcap =*/ logit_softcap,
+             /*.has_sinks     =*/ has_sinks ? 1 : 0,
+             /*.has_mask      =*/ has_mask ? 1 : 0,
++            /*.n_kv_max_padded =*/ amd_n_kv_pad,
+         };
+ 
+         // queries per threadgroup, matching the instantiation for this head size
+         static const bool pf512 = getenv("TOSH_FA_PF_DK512") != nullptr;
+         // MLA keeps K wider than V; the tile kernel it used to fall back to measures ~26% slower
+         static const bool pfmla = getenv("TOSH_FA_PF_MLA_DISABLE") == nullptr;
+         const bool fa_pf_512 = pf512 && ne00 == 512 && ne00 == ne20;
+         const bool fa_pf_mla = pfmla && ne00 == 576 && ne20 == 512 &&
+@@ -4444,16 +4451,48 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+             (wg_dk128 || ne11 >= 1024) &&
+             getenv("TOSH_FA_WG_DISABLE") == NULL ? 32 : 1;
+ 
+         char fa_amd_wg_pipeline[96];
+         if (fa_amd_nwg > 1) {
+             snprintf(fa_amd_wg_pipeline, sizeof(fa_amd_wg_pipeline), "%s_wg32", fa_amd_pipeline);
+         }
+ 
++        // sparse: build the compacted index list first, on the same encoder
++        ggml_metal_buffer_id bid_amd_idx = bid_tmp;
++        if (amd_sparse) {
++            bid_amd_idx.offs += ggml_metal_op_flash_attn_ext_extra_tmp(op)
++                              + ggml_metal_op_flash_attn_ext_extra_kv_f16(op);
++
++            ggml_metal_kargs_flash_attn_ext_vec_idx argsi = {
++                /*.ne30            =*/ ne30,
++                /*.ne31            =*/ ne31,
++                /*.ne32            =*/ ne32,
++                /*.ne33            =*/ ne33,
++                /*.nb31            =*/ nb31,
++                /*.nb32            =*/ nb32,
++                /*.nb33            =*/ nb33,
++                /*.n_kv_max        =*/ amd_n_kv_max,
++                /*.n_kv_max_padded =*/ amd_n_kv_pad,
++            };
++
++            auto pipei = ggml_metal_library_get_pipeline_flash_attn_ext_vec_idx(lib, op);
++
++            ggml_metal_encoder_set_pipeline(enc, pipei);
++            ggml_metal_encoder_set_bytes   (enc, &argsi, sizeof(argsi), 0);
++            ggml_metal_encoder_set_buffer  (enc, bid_src3,    1);
++            ggml_metal_encoder_set_buffer  (enc, bid_amd_idx, 2);
++
++            int nthi = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipei), 256);
++            nthi = std::max(32, (nthi/32)*32);
++
++            ggml_metal_encoder_dispatch_threadgroups(enc, ne31, ne32, ne33, nthi, 1, 1);
++            ggml_metal_op_concurrency_reset(ctx);
++        }
++
+         auto pipeline = ggml_metal_library_get_pipeline(lib, fa_amd_nwg > 1 ? fa_amd_wg_pipeline : fa_amd_pipeline);
+         if (!pipeline.pipeline) {
+             const char * nm = fa_amd_nwg > 1 ? fa_amd_wg_pipeline : fa_amd_pipeline;
+             pipeline = ggml_metal_library_compile_pipeline(lib, nm, nm, nullptr);
+         }
+ 
+         // dispatching more threads than the pipeline admits hangs the GPU, and how many
+         // it admits depends on the K type's dequant; fall through rather than risk it
+@@ -4467,16 +4506,17 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+         ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+         ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+         ggml_metal_encoder_set_buffer  (enc, bid_src2, 3);
+         ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
+         ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
+         ggml_metal_encoder_set_buffer  (enc, bid_pad,  6);
+         ggml_metal_encoder_set_buffer  (enc, fa_amd_nwg > 1 ? bid_tmp : bid_dst, 7);
++        ggml_metal_encoder_set_buffer  (enc, bid_amd_idx, 8);
+ 
+         ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03*fa_amd_nwg, props_dev->simd_width, fa_amd_nsg, 1);
+ 
+         if (fa_amd_nwg > 1) {
+             ggml_metal_op_concurrency_reset(ctx);
+ 
+             ggml_metal_kargs_flash_attn_ext_vec_reduce args0 = { (int32_t) (ne1*ne2*ne3) };
+ 
+diff --git a/ggml/src/ggml-metal/kernels/fa.metal b/ggml/src/ggml-metal/kernels/fa.metal
+index 79eca9a75..def0751bc 100644
+--- a/ggml/src/ggml-metal/kernels/fa.metal
++++ b/ggml/src/ggml-metal/kernels/fa.metal
+@@ -2480,30 +2480,32 @@ template [[host_name("kernel_lightning_indexer_q4_0")]] kernel kernel_lightning_
+ template [[host_name("kernel_lightning_indexer_q4_1")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q4_1, 2, dequantize_q4_1>;
+ template [[host_name("kernel_lightning_indexer_q5_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q5_0, 2, dequantize_q5_0>;
+ template [[host_name("kernel_lightning_indexer_q5_1")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q5_1, 2, dequantize_q5_1>;
+ template [[host_name("kernel_lightning_indexer_q8_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q8_0, 2, dequantize_q8_0>;
+ 
+ // vec kernel above miscompiles. Generalized over the K/V element type via the
+ // dequantize_*_t4 helpers; standard kernels cover their native dimensions and
+ // TurboQuant kernels cover padded head dimensions 128/256/384/512/640.
++
+ template<
+     short DK, short NSG,
+     typename k_t, short NKK, void (*deq_k)(device const k_t *, short, thread float4 &),
+     typename v_t, short NKV, void (*deq_v)(device const v_t *, short, thread float4 &),
+     short NW = 32, short NWG = 1, short SUBWP = 0, short DVP = 0>
+ kernel void kernel_flash_attn_ext_vec_amd(
+         constant ggml_metal_kargs_flash_attn_ext_amd & args [[buffer(0)]],
+         device const char * q     [[buffer(1)]],
+         device const char * k     [[buffer(2)]],
+         device const char * v     [[buffer(3)]],
+         device const char * mask  [[buffer(4)]],
+         device const char * sinks [[buffer(5)]],
+         device const char * pad   [[buffer(6)]],
+         device       char * dst   [[buffer(7)]],
++        device const int  * idx   [[buffer(8)]],
+         uint3  tgpig [[threadgroup_position_in_grid]],
+         ushort tiisg [[thread_index_in_simdgroup]],
+         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+     constexpr short DV  = DVP ? DVP : DK;   // MLA has DK != DV (K carries the rope tail, V is the bare latent)
+     constexpr short DK4 = DK/4;
+     constexpr short DV4 = DV/4;   // float4 per head row (32 for DV=128, 64 for DV=256)
+     // chunks per lane scale with the simd width; on wave64 with DK=128 the upper
+     // lanes own no chunk (guarded below) but still join the simd_sum reductions.
+@@ -2543,16 +2545,27 @@ kernel void kernel_flash_attn_ext_vec_amd(
+     device const char * vp = v + ikv2*args.nb22 + ikv3*args.nb23;
+ 
+     // Without a mask ne32/ne33 are 0, so the index math would divide by zero.
+     device const half * pm = (device const half *) mask;
+     if (args.has_mask) {
+         pm = (device const half *) (mask + iq1*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+     }
+ 
++    // sparse: the index list is laid out per (row, head, batch), same as the mask
++    // sparse when the host filled the index list; uniform across the threadgroup
++    const bool has_sparse = args.n_kv_max_padded > 0;
++
++    device const int * pidx = nullptr;
++    if (has_sparse) {
++        pidx = idx +
++            ((int64_t)(iq3%args.ne33)*args.ne32 + (iq2%args.ne32))*args.ne31*args.n_kv_max_padded +
++            (iq1%args.ne31)*args.n_kv_max_padded;
++    }
++
+     const short sub  = tiisg/SUBW;
+     const short lch  = tiisg%SUBW;
+     const short gidx = sgitg*RPS + sub;
+ 
+     float4 myq[NCK];  // this lane's slice(s) of the query
+     for (short c = 0; c < NCK; ++c) {
+         const short ch = lch + c*SUBW;
+         myq[c] = ch < DK4 ? q4[ch] : float4(0.0f);
+@@ -2560,26 +2573,36 @@ kernel void kernel_flash_attn_ext_vec_amd(
+ 
+     float4 acc[NCV];  // this lane's slice(s) of the output
+     for (short c = 0; c < NCV; ++c) {
+         acc[c] = float4(0.0f);
+     }
+     float m = -FLT_MAX/2;
+     float s = 0.0f;
+ 
+-    for (int j = (iwg*NSG + sgitg)*RPS + sub; j < args.ne11; j += NWG*NG) {
++    // sparse walks the compacted index list instead of the whole cache; a padded slot is -1
++    const int n_kv = has_sparse ? args.n_kv_max_padded : args.ne11;
++
++    for (int j = (iwg*NSG + sgitg)*RPS + sub; j < n_kv; j += NWG*NG) {
++        const int i11 = has_sparse ? pidx[j] : j;
++
+         // no early-out: the sub-groups of a simdgroup sit on different rows, so the
+         // skip is not uniform and the shuffle reduction below would diverge
+-        const float mv = args.has_mask ? (float) pm[j] : 0.0f;
++        const float mv = (has_sparse && i11 < 0) ? -MAXHALF
++                       : (args.has_mask ? (float) pm[i11] : 0.0f);
+         const bool  msk = mv <= -1e30f;
+         if (RPS == 1 && msk) {
+             continue;
+         }
+ 
+-        device const k_t * kb = (device const k_t *) (kp + (uint64_t) j*args.nb11);
++        // a padded slot keeps running through the body to hold the reduction uniform, and its
++        // weight ends up zero, but the address is still formed: read row 0 instead of -1
++        const int i11a = i11 < 0 ? 0 : i11;
++
++        device const k_t * kb = (device const k_t *) (kp + (uint64_t) i11a*args.nb11);
+         float pl = 0.0f;
+         for (short c = 0; c < NCK; ++c) {
+             const short ch = lch + c*SUBW;
+             if (ch < DK4) {
+                 float4 kreg;
+                 deq_k(kb + ch/NKK, ch%NKK, kreg);
+                 pl += dot(myq[c], kreg);
+             }
+@@ -2593,17 +2616,17 @@ kernel void kernel_flash_attn_ext_vec_amd(
+         }
+         const float p = pl; // full DK-dim Q.K
+ 
+         const float pp   = p*args.scale + mv;
+         const float nm   = msk ? m : max(m, pp);
+         const float corr = exp(m  - nm);
+         const float w    = msk ? 0.0f : exp(pp - nm);
+ 
+-        device const v_t * vb = (device const v_t *) (vp + (uint64_t) j*args.nb21);
++        device const v_t * vb = (device const v_t *) (vp + (uint64_t) i11a*args.nb21);
+         for (short c = 0; c < NCV; ++c) {
+             const short ch = lch + c*SUBW;
+             if (ch < DV4) {
+                 float4 vreg;
+                 deq_v(vb + ch/NKV, ch%NKV, vreg);
+                 acc[c] = acc[c]*corr + w*vreg;
+             }
+         }

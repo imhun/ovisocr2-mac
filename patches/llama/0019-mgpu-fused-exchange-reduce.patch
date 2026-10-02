@@ -1,0 +1,252 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.h b/ggml/src/ggml-metal/ggml-metal-context.h
+index cf42cf7e0..8ab795f0d 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.h
++++ b/ggml/src/ggml-metal/ggml-metal-context.h
+@@ -35,16 +35,21 @@ void ggml_metal_read_batch_end  (ggml_metal_t ctx);
+ bool ggml_metal_cpy_tensor_async_ex(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, const struct ggml_tensor * src, struct ggml_tensor * dst, bool prefer_events, bool hold_dst);
+ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
+ 
+ // acc += add, both f32 and contiguous. Encodes the kernel directly so a tensor-split
+ // allreduce does not pay a full graph submission per step.
+ bool ggml_metal_add_inplace_supported(ggml_metal_t ctx, const struct ggml_tensor * acc, const struct ggml_tensor * add);
+ bool ggml_metal_add_inplace_async    (ggml_metal_t ctx, struct ggml_tensor * acc, const struct ggml_tensor * add);
+ 
++// One command buffer per card per butterfly step: both copies and the add together.
++bool ggml_metal_exchange_reduce(ggml_metal_t ctx_self, ggml_metal_t ctx_peer,
++                                struct ggml_tensor * t_self, struct ggml_tensor * tmp_self,
++                                uint64_t seq);
++
+ enum ggml_status ggml_metal_graph_compute (ggml_metal_t ctx, struct ggml_cgraph * gf);
+ void             ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf);
+ 
+ void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev);
+ void ggml_metal_event_wait  (ggml_metal_t ctx, ggml_metal_event_t ev);
+ 
+ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx);
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index 2ecd8a91a..3a77125fd 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -177,16 +177,17 @@ static void ggml_metal_encode_pending_waits(ggml_metal_t ctx, id<MTLCommandBuffe
+ 
+ static void ggml_metal_cmd_buf_submit(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_buf) {
+     [cmd_buf commit];
+     [ctx->cmd_bufs_ext addObject:cmd_buf];
+     ctx->cmd_buf_last = cmd_buf;
+     [cmd_buf retain];
+ }
+ 
++
+ static void ggml_metal_cmd_buf_hold_flush(ggml_metal_t ctx) {
+     if (ctx->cmd_buf_hold == nil) {
+         return;
+     }
+ 
+     id<MTLCommandBuffer> cmd_buf = ctx->cmd_buf_hold;
+     ctx->cmd_buf_hold = nil;
+     ggml_metal_cmd_buf_submit(ctx, cmd_buf);
+@@ -784,17 +785,17 @@ bool ggml_metal_add_inplace_supported(ggml_metal_t ctx, const struct ggml_tensor
+ 
+     if (ggml_metal_get_buffer_id(acc).metal == nil || ggml_metal_get_buffer_id(add).metal == nil) {
+         return false;
+     }
+ 
+     return ggml_metal_library_get_pipeline_bin_one(ctx->lib, GGML_OP_ADD).pipeline != NULL;
+ }
+ 
+-bool ggml_metal_add_inplace_async(ggml_metal_t ctx, struct ggml_tensor * acc, const struct ggml_tensor * add) {
++static bool ggml_metal_add_inplace_into(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_buf_in, struct ggml_tensor * acc, const struct ggml_tensor * add) {
+     if (!ggml_metal_add_inplace_supported(ctx, acc, add)) {
+         // a copy may be holding its buffer open for this add, and nothing else would submit it
+         ggml_metal_cmd_buf_hold_flush(ctx);
+         return false;
+     }
+ 
+     struct ggml_metal_buffer_id bid_acc = ggml_metal_get_buffer_id(acc);
+     struct ggml_metal_buffer_id bid_add = ggml_metal_get_buffer_id(add);
+@@ -835,17 +836,17 @@ bool ggml_metal_add_inplace_async(ggml_metal_t ctx, struct ggml_tensor * acc, co
+ 
+     if (pipeline.c4) {
+         args.ne00 /= 4;
+         args.ne10 /= 4;
+         args.ne0  /= 4;
+     }
+ 
+     @autoreleasepool {
+-        id<MTLCommandBuffer> cmd_buf = ggml_metal_cmd_buf_continue(ctx);
++        id<MTLCommandBuffer> cmd_buf = cmd_buf_in != nil ? cmd_buf_in : ggml_metal_cmd_buf_continue(ctx);
+ 
+         ggml_metal_encoder_t enc = ggml_metal_encoder_init((ggml_metal_cmd_buf_t) cmd_buf, false);
+ 
+         ggml_metal_encoder_set_pipeline(enc, pipeline);
+         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+         ggml_metal_encoder_set_buffer  (enc, bid_acc, 1);
+         ggml_metal_encoder_set_buffer  (enc, bid_add, 2);
+         ggml_metal_encoder_set_buffer  (enc, bid_acc, 3);
+@@ -861,22 +862,92 @@ bool ggml_metal_add_inplace_async(ggml_metal_t ctx, struct ggml_tensor * acc, co
+             }
+ 
+             ggml_metal_encoder_dispatch_threadgroups(enc, args.ne01, args.ne02, args.ne03, nth, 1, 1);
+         }
+ 
+         ggml_metal_encoder_end_encoding(enc);
+         ggml_metal_encoder_free(enc);
+ 
+-        ggml_metal_cmd_buf_end(ctx, cmd_buf, false);
++        if (cmd_buf_in == nil) {
++            ggml_metal_cmd_buf_end(ctx, cmd_buf, false);
++        }
+     }
+ 
+     return true;
+ }
+ 
++bool ggml_metal_add_inplace_async(ggml_metal_t ctx, struct ggml_tensor * acc, const struct ggml_tensor * add) {
++    return ggml_metal_add_inplace_into(ctx, nil, acc, add);
++}
++
++// A buffer per copy is most of what a token creates, and creating one contends on Metal's
++// shared pools. Every card signals before it waits, so no pair can lock up.
++bool ggml_metal_exchange_reduce(ggml_metal_t ctx_self, ggml_metal_t ctx_peer,
++                                struct ggml_tensor * t_self, struct ggml_tensor * tmp_self,
++                                uint64_t seq) {
++    struct ggml_metal_xdev_link * link_out = ggml_metal_xdev_link_get(ctx_self, ctx_peer);
++    struct ggml_metal_xdev_link * link_in  = ggml_metal_xdev_link_get(ctx_peer, ctx_self);
++    if (link_out == NULL || link_in == NULL) {
++        return false;
++    }
++
++    struct ggml_metal_buffer_id bid_self = ggml_metal_get_buffer_id(t_self);
++    struct ggml_metal_buffer_id bid_tmp  = ggml_metal_get_buffer_id(tmp_self);
++    if (bid_self.metal == nil || bid_tmp.metal == nil) {
++        return false;
++    }
++
++    const size_t size = ggml_nbytes(t_self);
++    if (!ggml_metal_xdev_link_reserve(ctx_self, ctx_peer, link_out, size) ||
++        !ggml_metal_xdev_link_reserve(ctx_peer, ctx_self, link_in,  size)) {
++        return false;
++    }
++
++    if (!ggml_metal_add_inplace_supported(ctx_self, tmp_self, t_self)) {
++        return false;
++    }
++
++    // Both sides are handed the same number: reading it off the link races with whichever
++    // card the loop reached first. Links skip values, so the back-pressure wait names its own.
++    const uint64_t seq_prev = link_out->seq;
++    const uint64_t seq_out  = seq;
++    const uint64_t seq_in   = seq;
++    link_out->seq = seq;
++
++    @autoreleasepool {
++        id<MTLCommandBuffer> cmd_buf = ggml_metal_cmd_buf_continue(ctx_self);
++
++        if (seq_prev > 0) {
++            [cmd_buf encodeWaitForEvent:link_out->ev_done value:seq_prev];
++        }
++
++        id<MTLBlitCommandEncoder> enc_out = [cmd_buf blitCommandEncoder];
++        [enc_out copyFromBuffer:bid_self.metal sourceOffset:bid_self.offs
++                       toBuffer:link_out->wrap_src destinationOffset:0 size:size];
++        [enc_out endEncoding];
++        [cmd_buf encodeSignalEvent:link_out->ev_ready value:seq_out];
++
++        [cmd_buf encodeWaitForEvent:link_in->ev_ready value:seq_in];
++        id<MTLBlitCommandEncoder> enc_in = [cmd_buf blitCommandEncoder];
++        [enc_in copyFromBuffer:link_in->wrap_dst sourceOffset:0
++                      toBuffer:bid_tmp.metal destinationOffset:bid_tmp.offs size:size];
++        [enc_in endEncoding];
++        [cmd_buf encodeSignalEvent:link_in->ev_done value:seq_in];
++
++        ggml_metal_add_inplace_into(ctx_self, cmd_buf, t_self, tmp_self);
++
++        ggml_metal_cmd_buf_end(ctx_self, cmd_buf, false);
++    }
++
++    return true;
++}
++
++
++
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
+ static bool ggml_metal_moe_encode_range(
+         ggml_metal_t ctx, struct ggml_cgraph * gf, id<MTLCommandBuffer> cmd_buf, int start, int end) {
+     if (start >= end) {
+         return true;
+     }
+ 
+     ggml_metal_op_t ctx_op = ggml_metal_op_init(
+diff --git a/ggml/src/ggml-metal/ggml-metal.cpp b/ggml/src/ggml-metal/ggml-metal.cpp
+index 59cb7b03e..dd7c11237 100644
+--- a/ggml/src/ggml-metal/ggml-metal.cpp
++++ b/ggml/src/ggml-metal/ggml-metal.cpp
+@@ -552,16 +552,24 @@ static void ggml_backend_metal_read_batch_begin(ggml_backend_t backend) {
+     ggml_metal_read_batch_begin((ggml_metal_t) backend->context);
+ }
+ 
+ static void ggml_backend_metal_read_batch_end(ggml_backend_t backend) {
+     ggml_metal_read_batch_end((ggml_metal_t) backend->context);
+ }
+ #endif
+ 
++static bool ggml_backend_metal_exchange_reduce(ggml_backend_t backend_self, ggml_backend_t backend_peer,
++                                               ggml_tensor * t_self, ggml_tensor * tmp_self, uint64_t seq) {
++    ggml_metal_t ctx_self = (ggml_metal_t) backend_self->context;
++    ggml_metal_t ctx_peer = (ggml_metal_t) backend_peer->context;
++
++    return ggml_metal_exchange_reduce(ctx_self, ctx_peer, t_self, tmp_self, seq);
++}
++
+ static bool ggml_backend_metal_cpy_tensor_async_ex(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst, bool prefer_events, bool hold_dst) {
+     if (!ggml_backend_is_metal(backend_src) || !ggml_backend_is_metal(backend_dst)) {
+         return false;
+     }
+ 
+     if (!ggml_backend_buffer_is_metal(src->buffer) || !ggml_backend_buffer_is_metal(dst->buffer)) {
+         return false;
+     }
+@@ -1188,17 +1196,42 @@ static bool ggml_backend_metal_comm_allreduce_tensor(void * comm_ctx_v, ggml_ten
+                 return false;
+             }
+         }
+         step++;
+     }
+ 
+     // Every exchange of a step must read the partner's tensor before its own add rewrites it,
+     // so the copies all go out before any of the adds.
++    static int fused = -1;
++    if (fused < 0) {
++        fused = getenv("TOSH_MGPU_FUSED_EXCHANGE_DISABLE") == NULL ? 1 : 0;
++    }
++
+     for (size_t offset = offset_max; offset >= 1; offset /= 2) {
++        if (fused && prefer_events) {
++            static uint64_t seq_round = 0;
++            seq_round++;
++            bool ok = true;
++            for (size_t j = 0; j < 2*offset_max; j++) {
++                view_tmp(j, step);
++            }
++            for (size_t j = 0; j < 2*offset_max && ok; j++) {
++                ok = ggml_backend_metal_exchange_reduce(comm_ctx->backends[j], comm_ctx->backends[j ^ offset],
++                                                        tensors[j], &tmp[j], seq_round);
++            }
++            if (ok) {
++                reduced = true;
++                step++;
++                continue;
++            }
++            if (!ok) {
++                return false;
++            }
++        }
+         for (size_t j = 0; j < 2*offset_max; j++) {
+             if (!push(j, j ^ offset, step, hold_dst)) {
+                 return false;
+             }
+         }
+         for (size_t j = 0; j < 2*offset_max; j++) {
+             if (!reduce(j)) {
+                 return false;

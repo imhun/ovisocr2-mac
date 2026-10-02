@@ -1,0 +1,44 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal.cpp b/ggml/src/ggml-metal/ggml-metal.cpp
+index f41bf16eb..34a2d25f6 100644
+--- a/ggml/src/ggml-metal/ggml-metal.cpp
++++ b/ggml/src/ggml-metal/ggml-metal.cpp
+@@ -852,13 +852,14 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+ static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+ 
+     int min_batch = ggml_metal_device_get_props(ctx_dev)->op_offload_min_batch_size;
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
+-    // the bounded host cache leaves the bank without bytes, so the CPU backend cannot run it; the
+-    // device read the threshold before a plan could lower it
+-    if (tosh_hostcache_on()) min_batch = std::min(min_batch, TOSH_DMOE_MAX_TOKENS + 1);
++    // mixed execution takes every batch above its host path: the CPU backend would compute the
++    // resident experts too, and a bounded host cache leaves it no bytes. The device read the
++    // threshold before a plan could lower it
++    if (tosh_dmoe_enabled() || tosh_hostcache_on()) min_batch = std::min(min_batch, TOSH_DMOE_MAX_TOKENS + 1);
+ #endif
+     return (op->op == GGML_OP_MUL_MAT ||
+             op->op == GGML_OP_MUL_MAT_ID) &&
+             get_op_batch_size(op) >= min_batch;
+ }
+diff --git a/src/llama-tosh-dmoe.cpp b/src/llama-tosh-dmoe.cpp
+index f89c36daa..bcbabef62 100644
+--- a/src/llama-tosh-dmoe.cpp
++++ b/src/llama-tosh-dmoe.cpp
+@@ -1441,15 +1441,12 @@ int llama_tosh_dmoe_rare_tail() {
+     static const int n = getenv("TOSH_DMOE_RARE_TAIL") ? atoi(getenv("TOSH_DMOE_RARE_TAIL")) : 32;
+     return std::max(n, 0);
+ }
+ 
+ int llama_tosh_dmoe_wide_min_tokens() {
+-    // below the GPU's offload batch the experts run on the CPU backend, which cannot take -1 ids
+-    static const int n = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
+-    // a bounded host cache lowers the threshold after planning probes have read it
+-    if (tosh_hostcache_on()) return TOSH_DMOE_MAX_TOKENS + 1;
+-    return std::max(n, TOSH_DMOE_MAX_TOKENS + 1);
++    // every batch above the host path goes to the GPU, which offloads from the same size
++    return TOSH_DMOE_MAX_TOKENS + 1;
+ }
+ 
+ bool llama_tosh_dmoe_observe_prefill() {
+     static const bool on = getenv("TOSH_DMOE_OBSERVE_PREFILL") == nullptr || atoi(getenv("TOSH_DMOE_OBSERVE_PREFILL")) != 0;
+     return on && g_policy != nullptr;

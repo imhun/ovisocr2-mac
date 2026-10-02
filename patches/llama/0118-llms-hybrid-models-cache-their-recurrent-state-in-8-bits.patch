@@ -1,0 +1,471 @@
+diff --git a/common/tosh-plan.cpp b/common/tosh-plan.cpp
+index 9859530ed..a9b6be767 100644
+--- a/common/tosh-plan.cpp
++++ b/common/tosh-plan.cpp
+@@ -57,10 +57,12 @@ struct moe_info {
+     // the RAM cache keeps one pool per expert size and each must hold a whole layer
+     double warm_floor_mib = 0;
+     // sliding-window cache of one sequence per cache element size: what a context checkpoint holds
+     double swa_elems = 0;
+     int    n_swa     = 0;
++    // recurrent state of one sequence, every recurrent layer: what a hybrid model's checkpoint holds
++    double recr_elems = 0;
+     int    n_split   = 1;
+     std::string error;          // the model's metadata could not be read completely
+ };
+ 
+ struct host_mem {
+@@ -129,10 +131,21 @@ moe_info read_moe_info(const char * path) {
+                 heads = (int) gguf_get_val_u32(g, hid);
+             }
+             mi.swa_elems += (double) heads*(kl + vl);
+         }
+     }
++    const int d_state = u32_or(arch + ".ssm.state_size", 0);
++    const int d_inner = u32_or(arch + ".ssm.inner_size", 0);
++    if (d_state > 0 && d_inner > 0 && mi.n_layer > 0) {
++        const int d_conv   = u32_or(arch + ".ssm.conv_kernel", 0);
++        const int n_group  = u32_or(arch + ".ssm.group_count", 0);
++        const int interval = u32_or(arch + ".full_attention_interval", 0);
++        const int n_main   = mi.n_layer - u32_or(arch + ".nextn_predict_layers", 0);
++        int n_recr = 0;
++        for (int il = 0; il < n_main; ++il) n_recr += interval <= 0 || (il + 1) % interval != 0;
++        mi.recr_elems = (double) n_recr*((double) std::max(0, d_conv - 1)*(d_inner + 2*n_group*d_state) + (double) d_state*d_inner);
++    }
+     const int64_t sid = gguf_find_key(g, "split.count");
+     mi.n_split = sid < 0 ? 1 : std::max(1, (int) gguf_get_val_u16(g, sid));
+ 
+     std::vector<std::string> paths = { path };
+     if (mi.n_split > 1) {
+@@ -934,12 +947,17 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+     }
+     if (sel && sel->mode != "full_gpu" && p.projected_rss_mib == 0) p.projected_rss_mib = hi.self_rss_mib + p.host_required_mib;
+     // the server keeps context checkpoints and a prompt cache in RAM; they take what the plan leaves,
+     // checkpoints first since they spare re-reading a conversation, and the model before both
+     double left = runtime ? p.effective_mib - p.host_required_mib : hi.available_mib - HOST_MARGIN_MIB - p.host_required_mib;
+-    if (sel && mi.swa_elems > 0 && params.n_ctx_checkpoints > 0) {
+-        p.checkpoint_mib = mi.swa_elems*(mi.n_swa + sel->ubatch)*ggml_type_size(sel->kv)/ggml_blck_size(sel->kv)/MiB;
++    if (sel && (mi.swa_elems > 0 || mi.recr_elems > 0) && params.n_ctx_checkpoints > 0) {
++        // the server keeps checkpoints of a recurrent state in 8 bits unless told otherwise
++        const char * rs = getenv("TOSH_RS_STATE_TYPE");
++        const std::string rs_type = rs ? rs : "q8_0";
++        const double rs_bytes = rs_type == "f32" ? 4.0 : rs_type == "f16" || rs_type == "bf16" ? 2.0 : 34.0/32.0;
++        p.checkpoint_mib = mi.swa_elems*(mi.n_swa + sel->ubatch)*ggml_type_size(sel->kv)/ggml_blck_size(sel->kv)/MiB +
++                           mi.recr_elems*rs_bytes/MiB;
+         p.n_ctx_checkpoints = std::min(params.n_ctx_checkpoints, (int) std::max(0.0, std::floor(left/p.checkpoint_mib)));
+         if (p.n_ctx_checkpoints < params.n_ctx_checkpoints) p.warnings.push_back("CONTEXT_CHECKPOINTS_REDUCED");
+         left -= p.n_ctx_checkpoints*p.checkpoint_mib;
+         p.projected_rss_mib += p.n_ctx_checkpoints*p.checkpoint_mib;
+     } else {
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index eef855916..d6c11e464 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1177,15 +1177,15 @@ struct ggml_metal_device {
+     // upload ring: the blit shares the compute queue, so the only wait is slot reuse
+     id<MTLBuffer>        stage_set_bufs[4];
+     id<MTLCommandBuffer> stage_set_cmds[4];
+     int                  stage_set_cur;
+     // open read batch: blits accumulate into one command buffer, one wait at end
+-    id<MTLCommandBuffer>       stage_batch_cmd;
++    bool                       stage_batch_open;
++    id<MTLCommandBuffer>       stage_batch_cmd;   // created by the first read, released on flush
+     id<MTLBlitCommandEncoder>  stage_batch_enc;
+     size_t                     stage_batch_used;
+     int                        stage_batch_n;
+-    bool                       stage_batch_owned; // reopened inside a get: retained, released on flush
+     struct { void * dst; size_t off; size_t size; } stage_batch_items[16];
+ 
+     // cached no-copy wraps of host memory regions used as blit sources, so
+     // repeated uploads of the same weights don't churn kernel resources
+     struct {
+@@ -3797,15 +3797,12 @@ static void ggml_metal_device_stage_batch_flush(ggml_metal_device_t dev) {
+     for (int i = 0; i < dev->stage_batch_n; i++) {
+         memcpy(dev->stage_batch_items[i].dst,
+                (char *) dev->stage_buf.contents + dev->stage_batch_items[i].off,
+                dev->stage_batch_items[i].size);
+     }
+-    if (dev->stage_batch_owned) {
+-        [dev->stage_batch_enc release];
+-        [dev->stage_batch_cmd release];
+-        dev->stage_batch_owned = false;
+-    }
++    [dev->stage_batch_enc release];
++    [dev->stage_batch_cmd release];
+     dev->stage_batch_n    = 0;
+     dev->stage_batch_used = 0;
+     dev->stage_batch_enc  = nil;
+     dev->stage_batch_cmd  = nil;
+ }
+@@ -3814,32 +3811,20 @@ void ggml_metal_device_read_batch_begin(ggml_metal_device_t dev) {
+     // shared-buffer devices never take the stage path; skip the empty batch
+     if (dev->props.use_shared_buffers) {
+         return;
+     }
+     [dev->stage_lock lock];   // held until read_batch_end
+-    dev->stage_batch_cmd = [dev->mtl_queue commandBufferWithUnretainedReferences];
+-    dev->stage_batch_enc = [dev->stage_batch_cmd blitCommandEncoder];
++    // no command buffer yet: one left uncommitted by an empty batch keeps its slot in the queue
++    dev->stage_batch_open = true;
+ }
+ 
+ void ggml_metal_device_read_batch_end(ggml_metal_device_t dev) {
+     if (dev->props.use_shared_buffers) {
+         return;
+     }
+-    if (dev->stage_batch_cmd != nil) {
+-        if (dev->stage_batch_n > 0) {
+-            ggml_metal_device_stage_batch_flush(dev);
+-        } else {
+-            [dev->stage_batch_enc endEncoding];
+-            if (dev->stage_batch_owned) {
+-                [dev->stage_batch_enc release];
+-                [dev->stage_batch_cmd release];
+-                dev->stage_batch_owned = false;
+-            }
+-            dev->stage_batch_cmd = nil;
+-            dev->stage_batch_enc = nil;
+-        }
+-    }
++    ggml_metal_device_stage_batch_flush(dev);
++    dev->stage_batch_open = false;
+     [dev->stage_lock unlock];
+ }
+ 
+ static void ggml_metal_device_stage_batch_flush(ggml_metal_device_t dev);
+ 
+@@ -3860,23 +3845,24 @@ bool ggml_metal_device_stage_get(ggml_metal_device_t dev, struct ggml_metal_buff
+     const uint64_t t0 = tosh_prof_on() ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+ 
+     [dev->stage_lock lock];
+ 
+     // inside an open read batch: queue the blit, defer the wait to batch end
+-    if (dev->stage_batch_cmd != nil) {
++    if (dev->stage_batch_open) {
+         if (ggml_metal_device_stage_buf(dev) == nil) {
+             [dev->stage_lock unlock];
+             return false;   // no buffer: caller falls back to the direct path
+         }
+         // a full batch drains and reopens, so a long run of reads still pays one wait per
+         // staging buffer instead of one per read
+         if (dev->stage_batch_n == 16 || dev->stage_batch_used + size > ggml_metal_stage_batch_cap()) {
+             ggml_metal_device_stage_batch_flush(dev);
++        }
++        if (dev->stage_batch_cmd == nil) {
+             // the caller sits in an autorelease pool that drains before the batch ends
+-            dev->stage_batch_cmd   = [[dev->mtl_queue commandBufferWithUnretainedReferences] retain];
+-            dev->stage_batch_enc   = [[dev->stage_batch_cmd blitCommandEncoder] retain];
+-            dev->stage_batch_owned = true;
++            dev->stage_batch_cmd = [[dev->mtl_queue commandBufferWithUnretainedReferences] retain];
++            dev->stage_batch_enc = [[dev->stage_batch_cmd blitCommandEncoder] retain];
+         }
+         [dev->stage_batch_enc copyFromBuffer:bid_src.metal
+                                 sourceOffset:bid_src.offs
+                                     toBuffer:dev->stage_buf
+                            destinationOffset:dev->stage_batch_used
+diff --git a/include/llama.h b/include/llama.h
+index c3bbf06d5..29e4be9ae 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -924,10 +924,13 @@ extern "C" {
+ 
+ // Keeps the tensor data on device buffers (i.e. not accessible in host memory, but faster save/load).
+ // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
+ #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
+ 
++// a cached copy that may be stored in a smaller type; never for a state that must come back exact
++#define LLAMA_STATE_SEQ_FLAGS_COMPACT 4
++
+     typedef uint32_t llama_state_seq_flags;
+ 
+     LLAMA_API size_t llama_state_seq_get_size_ext(
+             struct llama_context * ctx,
+                     llama_seq_id   seq_id,
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index 57919accf..b4e825a56 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -762,11 +762,10 @@ size_t llama_memory_recurrent::size_p_bytes() const {
+ 
+     return size_p_bytes;
+ }
+ 
+ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+-    GGML_UNUSED(flags);
+ 
+     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
+     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data; // logical source row ranges
+     uint32_t cell_count = 0;
+ 
+@@ -839,11 +838,11 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
+     GGML_ASSERT(cell_count == cell_count_check);
+ 
+     io.write(&cell_count, sizeof(cell_count));
+ 
+     state_write_meta(io, cell_ranges, seq_id);
+-    state_write_data(io, cell_ranges_data);
++    state_write_data(io, cell_ranges_data, (flags & LLAMA_STATE_SEQ_FLAGS_COMPACT) && !(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE));
+ }
+ 
+ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+     GGML_UNUSED(flags);
+ 
+@@ -892,11 +891,43 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
+             }
+         }
+     }
+ }
+ 
+-void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
++// cached copies of an f32 state are kept in 8 bits: restoring rounds once, the live state stays f32
++static ggml_type rs_save_type() {
++    static const ggml_type t = [] {
++        const char * e = getenv("TOSH_RS_STATE_TYPE");
++        const std::string v = e ? e : "q8_0";
++        return v == "f16" ? GGML_TYPE_F16 : v == "bf16" ? GGML_TYPE_BF16 : v == "q8_0" ? GGML_TYPE_Q8_0 : GGML_TYPE_F32;
++    }();
++    return t;
++}
++
++static bool rs_save_small(const ggml_tensor * t, bool compact) {
++    return compact && rs_save_type() != GGML_TYPE_F32 && t->type == GGML_TYPE_F32;
++}
++
++static void rs_write_small(llama_io_write_i & io, ggml_tensor * t, size_t offset, size_t size, int64_t n_per_row) {
++    const ggml_type type = rs_save_type();
++    std::vector<float> f(size/sizeof(float));
++    ggml_backend_tensor_get(t, f.data(), offset, size);
++    const int64_t nrows = (int64_t) f.size()/n_per_row;
++    std::vector<uint8_t> q(ggml_row_size(type, n_per_row)*nrows);
++    ggml_quantize_chunk(type, f.data(), q.data(), 0, nrows, n_per_row, nullptr);
++    io.write(q.data(), q.size());
++}
++
++static void rs_read_small(llama_io_read_i & io, ggml_type type, ggml_tensor * t, size_t offset, size_t size, int64_t n_per_row) {
++    std::vector<float> f(size/sizeof(float));
++    std::vector<uint8_t> q(ggml_row_size(type, n_per_row)*(f.size()/n_per_row));
++    io.read(q.data(), q.size());
++    ggml_get_type_traits(type)->to_float(q.data(), f.data(), (int64_t) f.size());
++    ggml_backend_tensor_set(t, f.data(), offset, size);
++}
++
++void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, bool compact) const {
+     const uint32_t s_trans = 0;
+     const uint32_t n_layer = hparams.n_layer();
+ 
+     io.write(&s_trans, sizeof(s_trans));
+     io.write(&n_layer, sizeof(n_layer));
+@@ -905,24 +936,31 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
+     // Get whole range at a time
+     for (uint32_t il = 0; il < n_layer; ++il) {
+         // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
+         if (r_l[il] == nullptr) continue;
+ 
++        const bool r_small = rs_save_small(r_l[il], compact);
++
+         // Write R tensor type
+-        const int32_t r_type_i = (int32_t)r_l[il]->type;
++        const int32_t r_type_i = r_small ? (int32_t) rs_save_type() : (int32_t)r_l[il]->type;
+         io.write(&r_type_i, sizeof(r_type_i));
+ 
+         // Write row size of R tensor
+         const uint64_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+-        io.write(&r_size_row, sizeof(r_size_row));
++        const uint64_t r_size_row_w = r_small ? ggml_row_size(rs_save_type(), hparams.n_embd_r()) : r_size_row;
++        io.write(&r_size_row_w, sizeof(r_size_row_w));
+ 
+         // Write each logical cell row range. With pending recurrent rollback,
+         // the logical current state may live in a rollback snapshot plane.
+         for (const auto & range : cell_ranges) {
+             const size_t range_size = range.second - range.first;
+             const size_t buf_size = range_size * r_size_row;
+-            io.write_tensor(r_l[il], range.first * r_size_row, buf_size);
++            if (r_small) {
++                rs_write_small(io, r_l[il], range.first * r_size_row, buf_size, hparams.n_embd_r());
++            } else {
++                io.write_tensor(r_l[il], range.first * r_size_row, buf_size);
++            }
+         }
+ 
+         // the PLE conv history is a second recurrent row, so it has to travel with the first
+         if (p_l[il] != nullptr) {
+             const uint64_t p_size_row = ggml_row_size(p_l[il]->type, hparams.ple_conv_state());
+@@ -938,24 +976,31 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
+     if (!s_trans) {
+         for (uint32_t il = 0; il < n_layer; ++il) {
+             // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
+             if (s_l[il] == nullptr) continue;
+ 
++            const bool s_small = rs_save_small(s_l[il], compact);
++
+             // Write S tensor type
+-            const int32_t s_type_i = (int32_t)s_l[il]->type;
++            const int32_t s_type_i = s_small ? (int32_t) rs_save_type() : (int32_t)s_l[il]->type;
+             io.write(&s_type_i, sizeof(s_type_i));
+ 
+             // Write row size of S tensor
+             const uint64_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+-            io.write(&s_size_row, sizeof(s_size_row));
++            const uint64_t s_size_row_w = s_small ? ggml_row_size(rs_save_type(), hparams.n_embd_s()) : s_size_row;
++            io.write(&s_size_row_w, sizeof(s_size_row_w));
+ 
+             // Write each logical cell row range. With pending recurrent rollback,
+             // the logical current state may live in a rollback snapshot plane.
+             for (const auto & range : cell_ranges) {
+                 const size_t range_size = range.second - range.first;
+                 const size_t buf_size = range_size * s_size_row;
+-                io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
++                if (s_small) {
++                    rs_write_small(io, s_l[il], range.first * s_size_row, buf_size, hparams.n_embd_s());
++                } else {
++                    io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
++                }
+             }
+         }
+     } else {
+         // When S tensor is transposed, we also need the element size and get the element ranges from each row
+         const uint32_t mem_size = size;
+@@ -1111,27 +1156,33 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
+ 
+         // Read type of key
+         int32_t r_type_i_ref;
+         io.read(&r_type_i_ref, sizeof(r_type_i_ref));
+         const int32_t r_type_i = (int32_t) r_l[il]->type;
+-        if (r_type_i != r_type_i_ref) {
++        const bool r_small = r_type_i == GGML_TYPE_F32 && (r_type_i_ref == GGML_TYPE_F16 || r_type_i_ref == GGML_TYPE_BF16 || r_type_i_ref == GGML_TYPE_Q8_0);
++        if (r_type_i != r_type_i_ref && !r_small) {
+             LLAMA_LOG_ERROR("%s: mismatched r type (%d != %d, layer %d)\n", __func__, r_type_i, r_type_i_ref, il);
+             return false;
+         }
+ 
+         // Read row size of key
+         uint64_t r_size_row_ref;
+         io.read(&r_size_row_ref, sizeof(r_size_row_ref));
+         const size_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+-        if (r_size_row != r_size_row_ref) {
+-            LLAMA_LOG_ERROR("%s: mismatched r row size (%zu != %zu, layer %d)\n", __func__, r_size_row, (size_t) r_size_row_ref, il);
++        const size_t r_size_row_s = r_small ? ggml_row_size((ggml_type) r_type_i_ref, hparams.n_embd_r()) : r_size_row;
++        if (r_size_row_s != r_size_row_ref) {
++            LLAMA_LOG_ERROR("%s: mismatched r row size (%zu != %zu, layer %d)\n", __func__, r_size_row_s, (size_t) r_size_row_ref, il);
+             return false;
+         }
+ 
+         if (cell_count) {
+             // Read and set the keys for the whole cell range
+-            io.read_tensor(r_l[il], head * r_size_row, cell_count * r_size_row);
++            if (r_small) {
++                rs_read_small(io, (ggml_type) r_type_i_ref, r_l[il], head * r_size_row, cell_count * r_size_row, hparams.n_embd_r());
++            } else {
++                io.read_tensor(r_l[il], head * r_size_row, cell_count * r_size_row);
++            }
+         }
+ 
+         if (p_l[il] != nullptr) {
+             uint64_t p_size_row_ref;
+             io.read(&p_size_row_ref, sizeof(p_size_row_ref));
+@@ -1154,28 +1205,34 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
+ 
+             // Read type of value
+             int32_t s_type_i_ref;
+             io.read(&s_type_i_ref, sizeof(s_type_i_ref));
+             const int32_t s_type_i = (int32_t)s_l[il]->type;
++            const bool s_small = s_type_i == GGML_TYPE_F32 && (s_type_i_ref == GGML_TYPE_F16 || s_type_i_ref == GGML_TYPE_BF16 || s_type_i_ref == GGML_TYPE_Q8_0);
+ 
+-            if (s_type_i != s_type_i_ref) {
++            if (s_type_i != s_type_i_ref && !s_small) {
+                 LLAMA_LOG_ERROR("%s: mismatched s type (%d != %d, layer %d)\n", __func__, s_type_i, s_type_i_ref, il);
+                 return false;
+             }
+ 
+             // Read row size of value
+             uint64_t s_size_row_ref;
+             io.read(&s_size_row_ref, sizeof(s_size_row_ref));
+             const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+-            if (s_size_row != s_size_row_ref) {
+-                LLAMA_LOG_ERROR("%s: mismatched s row size (%zu != %zu, layer %d)\n", __func__, s_size_row, (size_t) s_size_row_ref, il);
++            const size_t s_size_row_s = s_small ? ggml_row_size((ggml_type) s_type_i_ref, hparams.n_embd_s()) : s_size_row;
++            if (s_size_row_s != s_size_row_ref) {
++                LLAMA_LOG_ERROR("%s: mismatched s row size (%zu != %zu, layer %d)\n", __func__, s_size_row_s, (size_t) s_size_row_ref, il);
+                 return false;
+             }
+ 
+             if (cell_count) {
+                 // Read and set the values for the whole cell range
+-                io.read_tensor(s_l[il], head * s_size_row, cell_count * s_size_row);
++                if (s_small) {
++                    rs_read_small(io, (ggml_type) s_type_i_ref, s_l[il], head * s_size_row, cell_count * s_size_row, hparams.n_embd_s());
++                } else {
++                    io.read_tensor(s_l[il], head * s_size_row, cell_count * s_size_row);
++                }
+             }
+         }
+     } else {
+         // For each layer, read the values for each cell (transposed)
+         for (uint32_t il = 0; il < n_layer; ++il) {
+diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
+index 4abb3f5cf..18e4a42e6 100644
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -128,11 +128,11 @@ private:
+     size_t size_r_bytes() const;
+     size_t size_s_bytes() const;
+     size_t size_p_bytes() const;
+ 
+     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
+-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
++    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, bool compact = false) const;
+ 
+     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
+     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
+ };
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index c1562861a..5b0815e51 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -299,12 +299,12 @@ struct server_slot {
+     bool prompt_save(server_prompt_cache & prompt_cache) const {
+         if (prompt.tokens.size() == 0) {
+             return false;
+         }
+ 
+-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
++        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_COMPACT);
++        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_COMPACT) : 0;
+ 
+         const size_t cur_size = cur_size_tgt + cur_size_dft;
+ 
+         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
+                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
+@@ -312,13 +312,13 @@ struct server_slot {
+         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+         if (cur == nullptr) {
+             return false;
+         }
+ 
+-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
++        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_COMPACT);
+         if (ctx_dft) {
+-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
++            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_COMPACT);
+         }
+ 
+         return true;
+     }
+ 
+@@ -2358,12 +2358,12 @@ private:
+         // [TAG_CHECKPOINTS_FIX_POS_MIN]
+         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
+         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
+         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+ 
+-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_COMPACT);
++        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_COMPACT);
+         // stash the draft's speculative state with the checkpoint
+         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+ 
+         SLT_TRC(slot,
+                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",

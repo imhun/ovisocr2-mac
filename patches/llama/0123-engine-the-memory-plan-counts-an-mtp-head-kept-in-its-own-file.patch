@@ -1,0 +1,110 @@
+diff --git a/common/tosh-plan.cpp b/common/tosh-plan.cpp
+index 0c7022c4f..a93bedbe7 100644
+--- a/common/tosh-plan.cpp
++++ b/common/tosh-plan.cpp
+@@ -15,10 +15,11 @@
+ #include <climits>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <filesystem>
+ #include <list>
+ #include <regex>
+ 
+ #ifdef __APPLE__
+ #include <chrono>
+@@ -823,15 +824,32 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+     // already counts weights, KV, compute, prefill slots and the driver margin
+     // an MTP head adds its own context and buffers after the plan; past the reserve the driver pages
+     // GPU memory into wired RAM, which slows every token and can use up the host
+     const auto & spec_types = params.speculative.types;
+     const bool mtp = std::find(spec_types.begin(), spec_types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != spec_types.end();
+-    const double reserve_auto = std::clamp(RESERVE_FRACTION*p.vram_total_mib, RESERVE_MIN_MIB, RESERVE_MAX_MIB) +
+-                                (mtp ? env_mib("TOSH_AUTO_MTP_RESERVE_MIB", 768.0) : 0.0);
+-    const double reserve_pref = env_mib("TOSH_AUTO_RESERVE_MIB", reserve_auto);
+-    const double reserves[2] = { reserve_pref, env_mib("TOSH_AUTO_MIN_RESERVE_MIB", std::max(512.0, reserve_pref - 256.0)) };
+-    for (double R : reserves) {
++    // a head that comes as its own file loads its weights after the plan as well
++    double mtp_mib = 0;
++    bool head_file = false;
++    if (mtp) {
++        std::error_code ec;
++        const std::string & head = params.speculative.draft.mparams.path;
++        const auto head_bytes = head.empty() ? 0 : std::filesystem::file_size(head, ec);
++        head_file = !head.empty() && !ec;
++        mtp_mib = env_mib("TOSH_AUTO_MTP_RESERVE_MIB", 768.0 + (head_file ? head_bytes/MiB : 0.0));
++    }
++    const double reserve_base = std::clamp(RESERVE_FRACTION*p.vram_total_mib, RESERVE_MIN_MIB, RESERVE_MAX_MIB);
++    const double reserve_pref = env_mib("TOSH_AUTO_RESERVE_MIB", reserve_base + mtp_mib);
++    std::vector<double> reserves = { reserve_pref, env_mib("TOSH_AUTO_MIN_RESERVE_MIB", std::max(512.0, reserve_pref - 256.0)) };
++    // the head is optional: where it leaves no room, the plan is made again without it
++    const size_t n_with_head = reserves.size();
++    if (mtp_mib > 0) {
++        reserves.push_back(reserve_pref - mtp_mib);
++        reserves.push_back(std::max(512.0, reserve_pref - mtp_mib - 256.0));
++    }
++    p.mtp_head_dropped = false;
++    for (size_t ri = 0; ri < reserves.size(); ++ri) {
++        const double R = reserves[ri];
+         evaluate(R);
+         const tosh_plan_candidate * f16 = find("full_gpu", kvs[0], 0);
+         const tosh_plan_candidate * q8  = kvs.size() > 1 ? find("full_gpu", kvs[1], 0) : nullptr;
+         if (force.empty() || force == "full") {
+             if (f16 && f16->valid) { sel = f16; p.reason = "the model and the requested context fit with the reserve"; }
+@@ -854,11 +872,12 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+             const tosh_plan_candidate * l8  = kvs.size() > 1 ? find("legacy_offload", kvs[1], 0) : nullptr;
+             if (l16 && l16->valid) sel = l16; else if (l8 && l8->valid) sel = l8;
+             if (sel) p.reason = "mixed execution is not available here; expert layers go to the host";
+         }
+         if (sel) {
+-            if (R < reserves[0]) p.fallback = string_format("reserve lowered to %.1f GiB", R/1024);
++            p.mtp_head_dropped = ri >= n_with_head;
++            if (R < reserves[p.mtp_head_dropped ? n_with_head : 0]) p.fallback = string_format("reserve lowered to %.1f GiB", R/1024);
+             break;
+         }
+     }
+ 
+     if (sel == nullptr) {
+@@ -1000,17 +1019,25 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+             sel = decide(hi1);
+             p.warnings.push_back("REPLANNED_AFTER_MEMORY_CHANGE");
+         }
+         p.recheck_ms = ms;
+     }
++    if (p.mtp_head_dropped) p.warnings.push_back("MTP_HEAD_DROPPED");
+     plan_emit(p);
+     if (out) *out = p;
+     if (getenv("TOSH_AUTO_DRY_RUN") != nullptr || sel == nullptr) {
+         return false;
+     }
+ 
+     // apply: the plan owns memory from here
++    if (p.mtp_head_dropped) {
++        LOG_WRN("%s: the MTP head does not fit beside the model, starting without it\n", __func__);
++        auto & types = params.speculative.types;
++        types.erase(std::remove(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP), types.end());
++        if (types.empty()) types = { COMMON_SPECULATIVE_TYPE_NONE };
++        params.speculative.draft.mparams = common_params_model();
++    }
+     params.fit_params = false;
+     params.n_gpu_layers = 999;
+     params.cache_type_k = p.kv;
+     params.cache_type_v = p.kv;
+     params.n_ctx = p.n_ctx;
+diff --git a/common/tosh-plan.h b/common/tosh-plan.h
+index 8a248b679..430f53fa4 100644
+--- a/common/tosh-plan.h
++++ b/common/tosh-plan.h
+@@ -97,10 +97,11 @@ struct tosh_plan {
+     std::string host_policy;        // static, runtime
+     std::string host_pressure;      // NORMAL, ELEVATED, CRITICAL
+     std::string full_host_code;     // FULL_HOST_SAFE or why the whole bank is not taken
+     std::string bounded_code;       // BOUNDED_HOST_SELECTED or why not
+     bool        host_simulated    = false;
++    bool        mtp_head_dropped  = false;   // the MTP head left no room and the plan goes on without it
+     bool        swap_growing      = false;
+     double      reclaimable_mib   = 0;
+     double      wired_mib         = 0;
+     double      compressed_mib    = 0;
+     double      swap_used_mib     = 0;
