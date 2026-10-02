@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# OvisOCR2 一键构建：环境检查 -> Python 依赖 -> GGUF 权重 -> llama.cpp + ToshLLM
-# 补丁 -> 编译 -> 冒烟测试。
+# OvisOCR2 一键构建：环境检查 -> Python 依赖 -> GGUF 权重 -> llama.cpp（委托给
+# 独立仓库去 clone、打补丁、编译、自检）-> 冒烟测试。
 #
 # 设计成可以反复执行：每一步都会先检查是否已经完成，完成了就跳过。
 # 想从头再来加 --clean。
@@ -19,12 +19,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 mkdir -p tmp
 
-WORK_DIR="tmp/tosh-llama"
-BUILD_DIR="build-tosh"
-LLAMA_REPO="https://github.com/ggml-org/llama.cpp"
-LLAMA_COMMIT="9575389609d6f8437de0b205561a4824d217c409"
-PATCH_DIR="patches/llama"
-PATCH_MARKER=".tosh-patch-series"
+# llama.cpp 的构建在独立仓库里维护（submodule 挂在 third_party/ 下）：
+# 补丁、pin 的版本、编译开关都在那边，这里只调用它。
+LLAMA_REPO_DIR="third_party/llamacpp-metal-amd"
+LLAMA_WORK_DIR="tmp/llama.cpp"
 
 JOBS="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 SKIP_MODELS=0
@@ -55,8 +53,9 @@ usage() {
     cat <<'EOF'
 OvisOCR2 一键构建
 
-  环境检查 -> Python 依赖 -> GGUF 权重 -> llama.cpp 源码 + ToshLLM 补丁
-  -> 编译 llama-mtmd-cli（Metal）-> 冒烟测试
+  环境检查 -> Python 依赖 -> GGUF 权重
+  -> llama.cpp（调 third_party/llamacpp-metal-amd 完成 clone / 打补丁 / 编译 / 自检）
+  -> 冒烟测试
 
 每一步都会先检查是否已完成，可以反复执行；想从头再来加 --clean。
 
@@ -64,13 +63,13 @@ OvisOCR2 一键构建
   ./scripts/build.sh [选项]
 
 选项:
-  --work-dir DIR    llama.cpp 工作目录（默认 tmp/tosh-llama）
+  --work-dir DIR    llama.cpp 工作目录（默认 tmp/llama.cpp）
   -j, --jobs N      并行编译数（默认 CPU 核数）
   --skip-models     跳过权重下载
   --skip-deps       跳过 Python 依赖安装
-  --skip-build      只准备源码与补丁，不编译
+  --skip-build      只准备 llama.cpp 源码与补丁，不编译
   --skip-smoke      跳过冒烟测试
-  --clean           删除工作目录后重新 clone 并打补丁
+  --clean           删掉工作目录后重新 clone 并打补丁
   -h, --help        显示这段帮助
 
 国内网络下载权重时指定镜像:
@@ -83,7 +82,7 @@ EOF
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --work-dir)   WORK_DIR="$2"; shift 2 ;;
+        --work-dir)   LLAMA_WORK_DIR="$2"; shift 2 ;;
         --jobs|-j)    JOBS="$2"; shift 2 ;;
         --skip-models) SKIP_MODELS=1; shift ;;
         --skip-deps)  SKIP_DEPS=1; shift ;;
@@ -95,12 +94,11 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-BUILD_PATH="$WORK_DIR/$BUILD_DIR"
-LLAMA_BIN="$BUILD_PATH/bin/llama-mtmd-cli"
+LLAMA_BIN="$REPO_ROOT/$LLAMA_WORK_DIR/build-metal/bin/llama-mtmd-cli"
 
 # ---------------------------------------------------------------- 0. 环境检查
 
-step "0/5 环境检查"
+step "0/4 环境检查"
 
 for tool in git cmake curl; do
     command -v "$tool" >/dev/null 2>&1 || die "缺少 $tool，请先安装"
@@ -130,13 +128,13 @@ fi
 
 if [ "$DO_CLEAN" -eq 1 ]; then
     step "清理 $WORK_DIR"
-    rm -rf "$WORK_DIR"
+    [ -e "$LLAMA_WORK_DIR" ] && mv "$LLAMA_WORK_DIR" "$LLAMA_WORK_DIR.removed-$(date +%s)"
     ok "已删除，接下来会重新 clone 并打补丁"
 fi
 
 # ---------------------------------------------------------------- 1. Python 依赖
 
-step "1/5 Python 环境"
+step "1/4 Python 环境"
 
 if [ "$SKIP_DEPS" -eq 1 ]; then
     warn "--skip-deps，跳过"
@@ -155,7 +153,7 @@ fi
 
 # ---------------------------------------------------------------- 2. 权重
 
-step "2/5 GGUF 权重"
+step "2/4 GGUF 权重"
 
 size_of() { [ -f "$1" ] && wc -c < "$1" | tr -d ' ' || echo 0; }
 
@@ -171,106 +169,44 @@ else
     ok "权重下载完成"
 fi
 
-# ---------------------------------------------------------------- 3. 源码 + 补丁
+# ---------------------------------------------------------------- 3. llama.cpp
+#
+# clone、打补丁、编译、自检都在独立仓库里做，这里只负责用本仓库的 tmp/ 当工作目录。
+# 补丁不需要在本仓库再存一份。
 
-step "3/5 llama.cpp 源码与 ToshLLM 补丁"
+step "3/4 llama.cpp（委托 $LLAMA_REPO_DIR）"
 
-[ -d "$PATCH_DIR" ] || die "找不到补丁目录 $PATCH_DIR"
-PATCH_TOTAL=$(ls "$PATCH_DIR"/*.patch 2>/dev/null | wc -l | tr -d ' ')
-[ "$PATCH_TOTAL" -gt 0 ] || die "$PATCH_DIR 里没有补丁"
-
-if [ ! -d "$WORK_DIR/.git" ]; then
-    mkdir -p "$(dirname "$WORK_DIR")"
-    echo "     clone $LLAMA_REPO"
-    git clone -q --filter=blob:none "$LLAMA_REPO" "$WORK_DIR" \
-        || die "clone 失败。GitHub 直连不通时先设代理：
+if [ ! -d "$LLAMA_REPO_DIR" ] || [ -z "$(ls -A "$LLAMA_REPO_DIR" 2>/dev/null)" ]; then
+    warn "子模块不在，先拉取"
+    git submodule update --init --recursive "$LLAMA_REPO_DIR" \
+        || die "子模块拉取失败。GitHub 直连不通时先设代理：
      export https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897"
-    ok "源码已就位"
-else
-    ok "源码目录已存在"
+fi
+[ -x "$LLAMA_REPO_DIR/scripts/build.sh" ] \
+    || die "$LLAMA_REPO_DIR 内容不完整（缺 scripts/build.sh）"
+
+mkdir -p "$LLAMA_WORK_DIR"
+
+SUBBUILD_ARGS=(--work-dir "$REPO_ROOT/$LLAMA_WORK_DIR" -j "$JOBS")
+if [ "$SKIP_BUILD" -eq 1 ]; then
+    SUBBUILD_ARGS+=(--patches-only)
+fi
+if [ "$DO_CLEAN" -eq 1 ]; then
+    SUBBUILD_ARGS+=(--clean)
 fi
 
-HEAD_COMMIT=$(git -C "$WORK_DIR" rev-parse HEAD)
-if [ "$HEAD_COMMIT" != "$LLAMA_COMMIT" ]; then
-    echo "     切换到 pin 的 commit $LLAMA_COMMIT（当前 ${HEAD_COMMIT:0:12}）"
-    git -C "$WORK_DIR" fetch -q origin "$LLAMA_COMMIT" 2>/dev/null \
-        || git -C "$WORK_DIR" fetch -q origin
-    git -C "$WORK_DIR" checkout -qf "$LLAMA_COMMIT"
-    ok "已切到 $LLAMA_COMMIT"
-else
-    ok "commit 正确：${LLAMA_COMMIT:0:12}"
-fi
-
-MARKER_PATH="$WORK_DIR/$PATCH_MARKER"
-MARKER_VALUE="$LLAMA_COMMIT $PATCH_TOTAL"
-
-if [ -f "$MARKER_PATH" ] && [ "$(cat "$MARKER_PATH")" = "$MARKER_VALUE" ]; then
-    ok "补丁已应用过（$PATCH_TOTAL 个），跳过"
-else
-    # 先确认第一号补丁能干净应用，再动手。否则会在打到一半时失败，
-    # 留下一棵半成品源码树。
-    FIRST_PATCH=$(ls "$PATCH_DIR"/*.patch | head -1)
-    if ! git -C "$WORK_DIR" apply --check "$REPO_ROOT/$FIRST_PATCH" 2>/dev/null; then
-        DIRTY=$(git -C "$WORK_DIR" status --porcelain | wc -l | tr -d ' ')
-        die "源码树不是 $LLAMA_COMMIT 的干净副本，补丁打不上去（当前有 $DIRTY 个改动）
-     可能是之前手动打过补丁。两个选择：
-       ./scripts/build.sh --clean          删掉重来（推荐）
-       printf '%s' '$MARKER_VALUE' > $MARKER_PATH   确认现有改动就是这套补丁，直接认下来"
-    fi
-    echo "     按文件名顺序应用 $PATCH_TOTAL 个补丁"
-    applied=0
-    for p in "$PATCH_DIR"/*.patch; do
-        if ! git -C "$WORK_DIR" apply "$REPO_ROOT/$p"; then
-            die "补丁失败：$(basename "$p")
-     源码树可能不是 $LLAMA_COMMIT 的干净副本，用 --clean 重来"
-        fi
-        applied=$((applied + 1))
-    done
-    printf '%s' "$MARKER_VALUE" > "$MARKER_PATH"
-    ok "$applied 个补丁全部应用成功，0 失败"
-fi
-
-# ---------------------------------------------------------------- 4. 编译
-
-step "4/5 编译 llama-mtmd-cli（Metal）"
+"$LLAMA_REPO_DIR/scripts/build.sh" "${SUBBUILD_ARGS[@]}" || die "llama.cpp 构建失败"
 
 if [ "$SKIP_BUILD" -eq 1 ]; then
-    warn "--skip-build，跳过"
-elif [ -x "$LLAMA_BIN" ]; then
-    ok "已存在构建产物，跳过（要重编加 --clean）"
+    warn "--skip-build，只准备了源码与补丁"
 else
-    if [ "$ARCH" = "x86_64" ]; then
-        SIMD_FLAGS=(
-            -DGGML_NATIVE=OFF -DCMAKE_OSX_ARCHITECTURES=x86_64
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0
-            -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_AVX2=ON
-            -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON
-            -DGGML_AVX_VNNI=OFF -DGGML_AVX512=OFF
-        )
-    else
-        SIMD_FLAGS=(-DGGML_NATIVE=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0)
-    fi
-
-    echo "     配置（Metal + Accelerate + ToshLLM 动态 MoE）"
-    cmake -S "$WORK_DIR" -B "$BUILD_PATH" \
-        -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
-        -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON \
-        -DTOSH_ENABLE_DYNAMIC_MOE=ON -DLLAMA_OPENSSL=OFF \
-        "${SIMD_FLAGS[@]}" > "$REPO_ROOT/tmp/cmake-configure.log" 2>&1 \
-        || die "cmake 配置失败，日志：tmp/cmake-configure.log"
-    ok "配置完成"
-
-    echo "     编译（-j $JOBS），首次大约 5-15 分钟"
-    cmake --build "$BUILD_PATH" -j "$JOBS" -t llama-mtmd-cli \
-        > "$REPO_ROOT/tmp/cmake-build.log" 2>&1 \
-        || die "编译失败，日志尾部：
-$(tail -20 "$REPO_ROOT/tmp/cmake-build.log")"
-    ok "编译完成：$LLAMA_BIN"
+    [ -x "$LLAMA_BIN" ] || die "构建结束但找不到 $LLAMA_BIN"
+    ok "llama-mtmd-cli: ${LLAMA_BIN#$REPO_ROOT/}"
 fi
 
-# ---------------------------------------------------------------- 5. 冒烟测试
+# ---------------------------------------------------------------- 4. 冒烟测试
 
-step "5/5 冒烟测试"
+step "4/4 冒烟测试"
 
 if [ "$SKIP_SMOKE" -eq 1 ]; then
     warn "--skip-smoke，跳过"

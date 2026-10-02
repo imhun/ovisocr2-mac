@@ -25,9 +25,11 @@ macOS 26.7.1，**非 Apple Silicon**。以下结论均来自本机实测。
 ## 一键构建
 
 克隆仓库后跑一条命令，脚本会依次完成：环境检查 → Python 依赖 → 下载 GGUF 权重 →
-clone llama.cpp 并打上 119 个补丁 → 编译 `llama-mtmd-cli` → 冒烟测试。
+llama.cpp（clone、打补丁、编译、自检）→ 冒烟测试。
 
 ```bash
+git clone --recurse-submodules https://github.com/imhun/ovisocr2-mac.git
+cd ovisocr2-mac
 ./scripts/build.sh
 
 # 国内网络下载权重慢，指定镜像
@@ -42,6 +44,11 @@ HF_BASE=https://hf-mirror.com/Abiray/OvisOCR2-GGUF/resolve/main ./scripts/build.
 
 每一步都会先检查是否已经完成，可以反复执行。首次编译大约 5-15 分钟（16 核实测），
 之后重跑会直接跳过。全部参数见 `./scripts/build.sh --help`。
+
+llama.cpp 那一段不是本仓库自己做的，而是调用
+[llamacpp-metal-amd](https://github.com/imhun/llamacpp-metal-amd)——那个仓库专门管
+补丁、pin 的版本和编译开关，编译产物落在本仓库的 `tmp/llama.cpp/`。它作为 submodule
+挂在 `third_party/` 下，克隆时忘了 `--recurse-submodules` 也没关系，构建脚本会自己补拉。
 
 冒烟测试会生成一张小测试图跑一次 OCR，并检查三件事：输出非空、没有 `@@@@` 之类的
 退化内容、日志里能读到 Metal 设备。这三项通过，说明补丁和 GPU 后端都正常工作。
@@ -181,27 +188,20 @@ export VK_ICD_FILENAMES=/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json
 ### 3.3 ToshLLM 补丁系列 —— ✅ 已适配成功
 
 这是本仓库最终采用的方案。做法是把 ToshLLM 验证过的补丁系列应用到它 pin 的
-llama.cpp commit 上，重建整个 Metal 后端。补丁已随仓库放在 `patches/llama/`
-（ToshLLM v0.87.13，119 个文件，逐字节未修改，来源见 `patches/README.md`）：
+llama.cpp commit 上，重建整个 Metal 后端。
+
+这部分和 OCR 没有关系——119 个补丁里 0 处提到 Ovis，改的全是 llama.cpp 自己的
+Metal 后端。所以它被拆成了独立仓库
+[llamacpp-metal-amd](https://github.com/imhun/llamacpp-metal-amd)，本仓库通过
+submodule 引用，构建时直接调用：
 
 ```bash
-# 1. 取它 pin 的 commit（补丁是针对这个版本验证的）
-git clone --filter=blob:none https://github.com/ggml-org/llama.cpp tmp/tosh-llama
-cd tmp/tosh-llama && git checkout -qf 9575389609d6f8437de0b205561a4824d217c409
+./scripts/build.sh              # 本仓库的脚本，内部会调 third_party/llamacpp-metal-amd
+./scripts/build.sh --skip-models --skip-deps    # 只是重建 llama.cpp 时
 
-# 2. 按文件名数字顺序应用全部 119 个补丁（0 失败）
-#    ../../patches/llama 是相对 tmp/tosh-llama 的路径
-for p in ../../patches/llama/*.patch; do
-  git apply "$p"
-done
-
-# 3. 构建（Metal + Accelerate）
-cmake -B build-tosh -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
-  -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DTOSH_ENABLE_DYNAMIC_MOE=ON \
-  -DGGML_NATIVE=OFF -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
-  -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON \
-  -DGGML_AVX_VNNI=OFF -DGGML_AVX512=OFF -DLLAMA_OPENSSL=OFF
-cmake --build build-tosh -j 8 -t llama-mtmd-cli
+# 也可以单独用那个仓库，任何多模态 GGUF 都能跑
+git clone --recurse-submodules https://github.com/imhun/llamacpp-metal-amd.git
+cd llamacpp-metal-amd && ./scripts/build.sh && ./scripts/verify.sh
 ```
 
 启动时会看到补丁生效的标志 —— stock 版没有的 SIMD 宽度探测与独显识别：
@@ -236,8 +236,9 @@ ggml_metal: device 0: AMD Radeon Pro 5500M (peer group 0, not bridged)
 同时对输出做损坏检测（识别 `@@@@` 与重复的 `## 1`）并告警。排查时加 `-v` 可以把
 llama.cpp 的原始日志透传出来，确认接管的是不是 Metal 后端。
 
-> 备注：`patches/llama/` 下共 119 个补丁，光 `0001` 和 `0002` 两个就有 15788 行，
-> 是针对 upstream `9575389609d6` 的完整 Metal 后端重建；换 commit 需要重新适配。
+> 备注：补丁共 119 个，光 `0001` 和 `0002` 两个就有 15788 行，是针对 upstream
+> `9575389609d6` 的完整 Metal 后端重建；换 commit 需要重新适配。这些细节现在维护在
+> [llamacpp-metal-amd](https://github.com/imhun/llamacpp-metal-amd) 里。
 > 另有 issue #15228 的早期 gist（`ggml-metal-optimized-4.m`），针对 2025-08 的
 > `ggml-metal.m` 结构，在当前代码上已无法直接套用。
 
@@ -254,7 +255,7 @@ llama.cpp 的原始日志透传出来，确认接管的是不是 Metal 后端。
 .venv/bin/python src/ovisocr2_llama.py scans/ -o out --max-side 2000    # 更清晰
 ```
 
-脚本会按 `tmp/tosh-llama/build-tosh/bin/llama-mtmd-cli` → `PATH` → 官方构建
+脚本会按 `tmp/llama.cpp/build-metal/bin/llama-mtmd-cli` → `PATH` → 官方构建
 的顺序自动挑选二进制，并用 `-ngl 99` 把模型全部放到 GPU。
 
 回退到 CPU 时（没有 GPU 构建）用缩图，视觉编码耗时与分辨率成正比：
@@ -309,7 +310,7 @@ pip install "vllm==0.22.1" pillow
 | `src/pdf2md.py` | **通用文档→MD**：PDF 走 anydoc 正文 + OvisOCR2 补图表页；Office 走 anydoc 结构化通道（表格/图片无损，无需 OCR） |
 | `src/ovisocr2_llama.py` | **可用**：llama.cpp CPU 推理（含自动缩图、think 清理） |
 | `src/ovisocr2_pytorch.py` | PyTorch / MPS 推理（需 Apple Silicon，本机跑不了） |
-| `patches/llama/` | ToshLLM v0.87.13 的 119 个 llama.cpp 补丁（GPL-3.0-or-later，来源见 `patches/README.md`） |
+| `third_party/llamacpp-metal-amd` | **submodule**：llama.cpp 的 Metal 补丁构建，独立仓库，补丁与版本 pin 都在那边 |
 | `scripts/build.sh` | **一键构建**：环境检查、依赖、权重、clone + 打补丁、编译、冒烟测试 |
 | `scripts/mps_probe.py` | MPS 能力与性能探测，可复现第二节 2 的数据 |
 | `scripts/fetch_gguf.sh` | GGUF 下载脚本（断点续传 + 重试，`HF_BASE` 可指向 hf-mirror 镜像） |

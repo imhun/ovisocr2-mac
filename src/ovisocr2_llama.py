@@ -103,8 +103,11 @@ def save_with_visual_regions(markdown: str, page: Image.Image, out_dir: Path) ->
 def find_llama_cli(explicit: str | None) -> str:
     if explicit:
         return explicit
-    # 优先级：ToshLLM 补丁版（AMD GPU 加速） > PATH > 官方源码构建
+    # 优先级：scripts/build.sh 的产物 > 独立仓库自己的默认路径 > PATH > 官方源码构建
     candidates = [
+        Path("tmp/llama.cpp/build-metal/bin/llama-mtmd-cli"),
+        Path("third_party/llamacpp-metal-amd/tmp/llama.cpp/build-metal/bin/llama-mtmd-cli"),
+        # 早期手工构建留下的路径，保留兼容
         Path("tmp/tosh-llama/build-tosh/bin/llama-mtmd-cli"),
         Path("tmp/llama.cpp/build/bin/llama-mtmd-cli"),
     ]
