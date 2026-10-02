@@ -16,7 +16,7 @@ macOS 26.7.1，**非 Apple Silicon**。以下结论均来自本机实测。
 | **llama.cpp + ToshLLM Metal 补丁** | ✅ **推荐** | **~9-15s** | **AMD GPU 全速，视觉编码仅 6.2s** |
 | llama.cpp CPU (Accelerate) | ✅ 可用 | ~68s | 回退方案；缩图后视觉编码 159s → 26s |
 | llama.cpp Metal (stock) | ❌ 输出损坏 | 39s 后崩 | GPU Timeout + `@@@@` 乱码 |
-| llama.cpp Vulkan (MoltenVK) | ❌ 输出损坏 | ~27s | 输出全为 `1`，CLIP `SOFT_MAX` 不支持 |
+| llama.cpp Vulkan (MoltenVK) | ❌ 输出损坏 | ~27s | 输出全为 `1`，原因未定位（见 3.2） |
 
 **当前可立即使用**：`src/ovisocr2_llama.py`，默认走 ToshLLM Metal 补丁版（AMD GPU 加速）。
 
@@ -154,15 +154,22 @@ Vulkan0: AMD Radeon Pro 5500M (8176 MiB)
 Vulkan1: Intel(R) UHD Graphics 630 (65536 MiB)
 ```
 
-但输出全是 `1`，且日志明确报告视觉编码器缺算子：
+但输出全是 `1`。日志里有算子回退的告警：
 
 ```
 W resolve_fused_ops: layer 3 is assigned to device Vulkan0 but Flash Attention is assigned to device CPU
 W warmup: WARNING: flash attention not supported by Vulkan0
 W warmup: WARNING: the CLIP graph uses unsupported operators by the backend
+W warmup:          the performance will be suboptimal
 W warmup: list of unsupported ops (backend=Vulkan0):
 W warmup:   SOFT_MAX: type = f32, ne = [8580 8580 12 1]
 ```
+
+**这条告警不能当成失败原因**。同一个模型在打上 ToshLLM 补丁的 Metal 后端上跑得完全
+正确，日志里的告警列表一模一样（同样的 `SOFT_MAX` / `CONT` / `PERMUTE` / `ROPE`，
+只有尺寸随分辨率变化）。它只说明这些算子回退到 CPU、性能打折，不是出错。所以 Vulkan
+输出全 `1` 的根因还没定位，只能确认症状与 issue #20104
+（Vulkan on Intel Macs produce gibberish）一致，该 issue 被标记为 #20029 的重复项。
 
 这与 issue #20104（Vulkan on Intel Macs produce gibberish）一致，该 issue 被标记为
 #20029 的重复项。Zsh 侧无需额外设置，但运行前需要指定 ICD：
