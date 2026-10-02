@@ -30,6 +30,7 @@ SKIP_DEPS=0
 SKIP_SMOKE=0
 SKIP_BUILD=0
 DO_CLEAN=0
+FORCE_LOCAL_LLAMA=0
 
 MODEL="models/OvisOCR2-Q4_K_M.gguf"
 MMPROJ="models/mmproj-F16.gguf"
@@ -68,6 +69,7 @@ OvisOCR2 一键构建
   --skip-models     跳过权重下载
   --skip-deps       跳过 Python 依赖安装
   --skip-build      只准备 llama.cpp 源码与补丁，不编译
+  --build-llama     强制在本地重新编译 llama.cpp，不用全局安装
   --skip-smoke      跳过冒烟测试
   --clean           删掉工作目录后重新 clone 并打补丁
   -h, --help        显示这段帮助
@@ -87,6 +89,7 @@ while [ $# -gt 0 ]; do
         --skip-models) SKIP_MODELS=1; shift ;;
         --skip-deps)  SKIP_DEPS=1; shift ;;
         --skip-build) SKIP_BUILD=1; shift ;;
+        --build-llama) FORCE_LOCAL_LLAMA=1; shift ;;
         --skip-smoke) SKIP_SMOKE=1; shift ;;
         --clean)      DO_CLEAN=1; shift ;;
         -h|--help)    usage ;;
@@ -187,15 +190,36 @@ fi
 
 mkdir -p "$LLAMA_WORK_DIR"
 
-SUBBUILD_ARGS=(--work-dir "$REPO_ROOT/$LLAMA_WORK_DIR" -j "$JOBS")
-if [ "$SKIP_BUILD" -eq 1 ]; then
-    SUBBUILD_ARGS+=(--patches-only)
-fi
-if [ "$DO_CLEAN" -eq 1 ]; then
-    SUBBUILD_ARGS+=(--clean)
+# 已经有全局安装就直接用，省掉一次编译（llamacpp-metal-amd 的 scripts/install.sh 装的）
+GLOBAL_BIN=""
+for cand in "$(command -v llama-mtmd-cli-amd 2>/dev/null || true)" \
+            "/usr/local/lib/llamacpp-metal-amd/llama-mtmd-cli" \
+            "/opt/homebrew/lib/llamacpp-metal-amd/llama-mtmd-cli"; do
+    if [ -n "$cand" ] && [ -x "$cand" ]; then GLOBAL_BIN="$cand"; break; fi
+done
+
+USE_GLOBAL=0
+if [ "$FORCE_LOCAL_LLAMA" -eq 0 ] && [ "$SKIP_BUILD" -eq 0 ] \
+   && [ ! -x "$LLAMA_BIN" ] && [ -n "$GLOBAL_BIN" ]; then
+    # 只认带补丁标记的，别把官方版当加速版用
+    grep -aq "probed SIMD-group" "$GLOBAL_BIN" && USE_GLOBAL=1
 fi
 
-"$LLAMA_REPO_DIR/scripts/build.sh" "${SUBBUILD_ARGS[@]}" || die "llama.cpp 构建失败"
+if [ "$USE_GLOBAL" -eq 1 ]; then
+    LLAMA_BIN="$GLOBAL_BIN"
+    ok "复用全局安装：$GLOBAL_BIN"
+    echo "     要强制本地编译加 --build-llama"
+else
+    SUBBUILD_ARGS=(--work-dir "$REPO_ROOT/$LLAMA_WORK_DIR" -j "$JOBS")
+    if [ "$SKIP_BUILD" -eq 1 ]; then
+        SUBBUILD_ARGS+=(--patches-only)
+    fi
+    if [ "$DO_CLEAN" -eq 1 ]; then
+        SUBBUILD_ARGS+=(--clean)
+    fi
+
+    "$LLAMA_REPO_DIR/scripts/build.sh" "${SUBBUILD_ARGS[@]}" || die "llama.cpp 构建失败"
+fi
 
 if [ "$SKIP_BUILD" -eq 1 ]; then
     warn "--skip-build，只准备了源码与补丁"

@@ -103,10 +103,13 @@ def save_with_visual_regions(markdown: str, page: Image.Image, out_dir: Path) ->
 def find_llama_cli(explicit: str | None) -> str:
     if explicit:
         return explicit
-    # 优先级：scripts/build.sh 的产物 > 独立仓库自己的默认路径 > PATH > 官方源码构建
+    # 优先级：本仓库构建的 > 独立仓库默认路径 > 全局安装 > PATH > 官方源码构建
     candidates = [
         Path("tmp/llama.cpp/build-metal/bin/llama-mtmd-cli"),
         Path("third_party/llamacpp-metal-amd/tmp/llama.cpp/build-metal/bin/llama-mtmd-cli"),
+        # ./scripts/install.sh 装到全局的位置（供多个项目共用）
+        Path("/usr/local/lib/llamacpp-metal-amd/llama-mtmd-cli"),
+        Path("/opt/homebrew/lib/llamacpp-metal-amd/llama-mtmd-cli"),
         # 早期手工构建留下的路径，保留兼容
         Path("tmp/tosh-llama/build-tosh/bin/llama-mtmd-cli"),
         Path("tmp/llama.cpp/build/bin/llama-mtmd-cli"),
@@ -114,9 +117,12 @@ def find_llama_cli(explicit: str | None) -> str:
     for candidate in candidates:
         if candidate.exists():
             return str(candidate)
-    found = shutil.which("llama-mtmd-cli")
-    if found:
-        return found
+    # llama-mtmd-cli-amd 是 install.sh 装的补丁版；后面那个通用名字可能是
+    # brew 装的官方版（在独显上输出是乱的），只当最后兜底。
+    for name in ("llama-mtmd-cli-amd", "llama-mtmd-cli"):
+        found = shutil.which(name)
+        if found:
+            return found
     raise SystemExit(
         "找不到 llama-mtmd-cli。请先安装 llama.cpp（brew install llama.cpp），"
         "或用 --llama-bin 指定路径。"
